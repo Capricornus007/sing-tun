@@ -1,6 +1,6 @@
 module github.com/sagernet/sing-tun
 
-go 1.25.0
+go 1.27.0
 
 require (
 	github.com/florianl/go-nfqueue/v2 v2.1.0
