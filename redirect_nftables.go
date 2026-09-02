@@ -388,7 +388,7 @@ func (r *autoRedirect) nftablesCreatePreMatchChains(nft *nftables.Conn, table *n
 		Name:     "prerouting_prematch",
 		Table:    table,
 		Hooknum:  nftables.ChainHookPrerouting,
-		Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityNATDest - 1),
+		Priority: new(*nftables.ChainPriorityNATDest - 1),
 		Type:     nftables.ChainTypeFilter,
 	})
 	err := r.nftablesAddPreMatchRules(nft, table, chainPreroutingPreMatch, true)
@@ -401,7 +401,7 @@ func (r *autoRedirect) nftablesCreatePreMatchChains(nft *nftables.Conn, table *n
 			Name:     "output_prematch",
 			Table:    table,
 			Hooknum:  nftables.ChainHookOutput,
-			Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityMangle + 1),
+			Priority: new(*nftables.ChainPriorityMangle + 1),
 			Type:     nftables.ChainTypeFilter,
 		})
 		err = r.nftablesAddPreMatchRules(nft, table, chainOutputPreMatch, false)
