@@ -3,9 +3,11 @@ package tun
 import (
 	"hash/maphash"
 	"math"
+	"net"
 	"net/netip"
 	"runtime"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
+	N "github.com/sagernet/sing/common/network"
 )
 
 const (
@@ -21,44 +24,6 @@ const (
 	goEngineLoadWindow  = 100 * time.Millisecond
 	goEngineBusyPercent = 70
 )
-
-type goFrame struct {
-	data []byte
-	meta ForwardFrameMeta
-}
-
-type goSocketEvent struct {
-	token    uint32
-	readable bool
-	writable bool
-}
-
-const (
-	goInterestRead uint8 = 1 << iota
-	goInterestWrite
-)
-
-var errGoQueueUnavailable = E.New("go: tun queue unavailable")
-
-type goPlatformIO interface {
-	start() error
-	wait(timeout time.Duration, events []goSocketEvent) (tunReadable bool, count int, err error)
-	registerSocket(socket *goSocket, token uint32, interest uint8) error
-	updateSocket(socket *goSocket, interest uint8) error
-	unregisterSocket(socket *goSocket)
-	readBurst(frames []goFrame) (count int, drained bool, err error)
-	writeFrame(frame [][]byte, meta ForwardFrameMeta) error
-	writeData(frame [][]byte, meta ForwardFrameMeta) error
-	flush()
-	transmitPrefix() int
-	transmitChecksumOffload() bool
-	transmitSegmentOffload() bool
-	armTransmitWritable() (bool, error)
-	takeTransmitWritable() bool
-	wake()
-	drainWake()
-	close() error
-}
 
 const (
 	goMessageStackClose uint8 = iota
@@ -70,6 +35,7 @@ const (
 	goMessageConnWindow
 	goMessageConnBlocked
 	goMessageConnDropped
+	goMessageConnPacing
 	goMessageConnSplice
 	goMessagePacketSplice
 	goMessagePacketClose
@@ -132,14 +98,6 @@ func (s *goControlStack) push(message *goMessage) {
 	}
 }
 
-func (s *goControlStack) empty() bool {
-	return s.head.Load() == nil
-}
-
-func (s *goControlStack) popAll() *goMessage {
-	return s.head.Swap(nil)
-}
-
 const (
 	goEngineRunning uint32 = iota
 	goEngineParked
@@ -158,6 +116,8 @@ type goEngine struct {
 	injectMessage        goMessage
 	droppedInjectFrames  goDropCounter
 	engineState          atomic.Uint32
+	exitReapPending      atomic.Bool
+	exitReapAccess       sync.Mutex
 	coarseTime           atomic.Int64
 	epoch                time.Time
 	frames               []goFrame
@@ -169,11 +129,14 @@ type goEngine struct {
 	reclaimTickNode      goWheelNode
 	reassemblyEntries    []goReassemblyEntry
 	udpUserData          goUDPUserData
-	udpSessions          map[udpNatSessionKey]*goUDPSession
+	udpNat               *UDPNat
 	transmitFrame        [1][]byte
 	exitSignal           chan struct{}
 	wokeHandlerThisBurst bool
 	tunPending           bool
+	transmitReady        bool
+	readBuffersHeld      bool
+	idleSince            int64
 	parkedNanos          int64
 	loadWindowStart      int64
 	ackCoalescing        bool
@@ -184,7 +147,17 @@ type goEngine struct {
 	spliceDirtyList      *GoConn
 	spliceSegments       [][]byte
 	spliceIovecs         []goIOVector
-	packetReceive        *buf.Buffer
+	packetReceiveBuffers [goPacketBatchSize]*buf.Buffer
+	packetReceiveBatch   int
+	packetMessages       [goPacketBatchSize]goPacketMessage
+	packetFrames         [goPacketBatchSize]goUDPFrame
+	packetFrameCount     int
+	packetUploads        [goPacketBatchSize]goPacketUpload
+	packetUploadCount    int
+	packetDirtyList      *goSplicePacket
+	packetIO             goPacketBatchIO
+	packetFlows          map[flowKey]*GoPacketConn
+	packetReadOptions    atomic.Pointer[N.ReadWaitOptions]
 
 	flows           map[flowKey]*GoConn
 	flowCapacity    int
@@ -201,6 +174,14 @@ type goEngine struct {
 	controlSegments [][]byte
 	sackScratch     [goMaxSackBlocks]goSackBlock
 	sackRaw         [goMaxSackBlocks]goRawSackBlock
+	rateSample      goRateSample
+	ackSample       goAckSample
+
+	gsoReadOptions N.ReadWaitOptions
+	gsoBuffers     [goGSOMaxSegments]*buf.Buffer
+	gsoSegments    [goGSOMaxSegments][]byte
+	gsoSizes       [goGSOMaxSegments]int
+	gsoFrame       goFrame
 }
 
 func (e *goEngine) singleFrame(packet []byte) [][]byte {
@@ -210,33 +191,36 @@ func (e *goEngine) singleFrame(packet []byte) [][]byte {
 
 func newGoEngine(stack *Go, platformIO goPlatformIO, engineCount int) *goEngine {
 	engine := &goEngine{
-		stack:             stack,
-		platformIO:        platformIO,
-		dispatcher:        stack.dispatcher,
-		dispatchStage:     stack.dispatcher.NewStage(&goWriteback{platformIO: platformIO}),
-		epoch:             time.Now(),
-		frames:            make([]goFrame, goReadBatch),
-		reassemblyEntries: make([]goReassemblyEntry, goReassemblyEntries),
-		exitSignal:        make(chan struct{}),
-		flows:             make(map[flowKey]*GoConn),
-		udpSessions:       make(map[udpNatSessionKey]*goUDPSession),
-		flowCapacity:      max(goFlowCapacity/engineCount, 1024),
-		slabPool:          newGoSlabPool(stack.memoryPressure, max(goSlabPoolLowWater/engineCount, 8)),
-		descriptorPool:    goDescriptorPool{lowWater: max(goDescriptorPoolLowWater/engineCount, 4)},
-		sequenceSeed:      maphash.MakeSeed(),
-		controlSegments:   make([][]byte, 0, 8),
-		socketEvents:      make([]goSocketEvent, goSocketEventBatch),
-		spliceSegments:    make([][]byte, 0, 8),
-		spliceIovecs:      make([]goIOVector, 0, 8),
+		stack:              stack,
+		platformIO:         platformIO,
+		dispatcher:         stack.dispatcher,
+		dispatchStage:      stack.dispatcher.NewStage(&goWriteback{platformIO: platformIO}),
+		epoch:              time.Now(),
+		frames:             make([]goFrame, goReadBatch),
+		reassemblyEntries:  make([]goReassemblyEntry, goReassemblyEntries),
+		exitSignal:         make(chan struct{}),
+		flows:              make(map[flowKey]*GoConn),
+		flowCapacity:       max(goFlowCapacity/engineCount, 1024),
+		slabPool:           newGoSlabPool(stack.memoryPressure, max(goSlabPoolLowWater/engineCount, 8)),
+		descriptorPool:     goDescriptorPool{lowWater: max(goDescriptorPoolLowWater/engineCount, 4)},
+		sequenceSeed:       maphash.MakeSeed(),
+		controlSegments:    make([][]byte, 0, 8),
+		socketEvents:       make([]goSocketEvent, goSocketEventBatch),
+		spliceSegments:     make([][]byte, 0, 8),
+		spliceIovecs:       make([]goIOVector, 0, 8),
+		packetFlows:        make(map[flowKey]*GoPacketConn, goReadBatch),
+		packetReceiveBatch: goReceiveBatchMin,
 	}
 	engine.closeMessage.kind = goMessageStackClose
 	engine.resetMessage.kind = goMessageStackReset
 	engine.injectMessage.kind = goMessageInject
+	engine.packetReadOptions.Store(new(N.ReadWaitOptions))
 	engine.delayedAckTickNode.expire = engine.expireDelayedAckTick
 	engine.reassemblyTickNode.expire = engine.expireReassemblyTick
 	engine.sweepTickNode.expire = engine.expireSweepTick
 	engine.reclaimTickNode.expire = engine.expireReclaimTick
 	engine.refreshCoarseTime()
+	engine.wheel.currentTick = engine.now() / goWheelTick
 	engine.wheel.schedule(&engine.sweepTickNode, engine.now()+int64(goSweepInterval))
 	engine.wheel.schedule(&engine.reclaimTickNode, engine.now()+int64(goReclaimInterval))
 	return engine
@@ -247,7 +231,7 @@ func (e *goEngine) run() {
 	defer e.exit()
 	e.loadWindowStart = e.now()
 	for {
-		parkStart := int64(time.Since(e.epoch))
+		parkStart := e.readClock()
 		tunReadable, eventCount, err := e.park()
 		e.parkedNanos += e.now() - parkStart
 		e.updateLoad(e.now())
@@ -255,7 +239,9 @@ func (e *goEngine) run() {
 		if e.stack.closed.Load() {
 			return
 		}
-		if e.platformIO.takeTransmitWritable() {
+		transmitWritable := e.platformIO.takeTransmitWritable()
+		if e.transmitReady || transmitWritable {
+			e.transmitReady = false
 			e.releaseBlockedWriters()
 		}
 		if err != nil {
@@ -280,8 +266,10 @@ func (e *goEngine) run() {
 		e.dispatchSocketEvents(eventCount)
 		e.flushSpliceDirty()
 		e.wheel.advance(e.now())
-		e.flushAcks()
+		e.drainAckList(e.now(), true)
 		e.dispatchStage.Flush()
+		e.flushPacketUploads()
+		e.flushPacketFrames()
 		e.platformIO.flush()
 		e.reapDying()
 		if e.reclaimPending {
@@ -297,8 +285,9 @@ func (e *goEngine) run() {
 
 func (e *goEngine) exit() {
 	e.shutdown()
+	e.releaseReadBuffers()
 	e.engineState.Store(goEngineExited)
-	message := e.controlStack.popAll()
+	message := e.controlStack.head.Swap(nil)
 	for message != nil {
 		next := message.next
 		message.next = nil
@@ -307,6 +296,22 @@ func (e *goEngine) exit() {
 		message = next
 	}
 	e.releaseInjected()
+	e.slabPool.close()
+	if e.dyingList != nil {
+		e.exitReapPending.Store(true)
+		e.reapAfterExit()
+	}
+}
+
+func (e *goEngine) reapAfterExit() {
+	if !e.exitReapPending.Load() {
+		return
+	}
+	e.exitReapAccess.Lock()
+	defer e.exitReapAccess.Unlock()
+	e.refreshCoarseTime()
+	e.reapDying()
+	e.exitReapPending.Store(e.dyingList != nil)
 }
 
 func (e *goEngine) updateLoad(now int64) {
@@ -321,9 +326,10 @@ func (e *goEngine) updateLoad(now int64) {
 }
 
 func (e *goEngine) park() (bool, int, error) {
+	clear(e.packetFlows)
 	deadline, scheduled := e.wheel.nextDeadline()
 	e.engineState.Store(goEngineParked)
-	if !e.controlStack.empty() {
+	if e.controlStack.head.Load() != nil {
 		e.engineState.Store(goEngineRunning)
 		e.refreshCoarseTime()
 		return false, 0, nil
@@ -335,11 +341,67 @@ func (e *goEngine) park() (bool, int, error) {
 	if e.tunPending {
 		timeout = 0
 	}
-	tunReadable, eventCount, err := e.platformIO.wait(timeout, e.socketEvents)
+	tunReadable, eventCount, err := e.platformIO.wait(0, e.socketEvents)
+	e.transmitReady = e.platformIO.takeTransmitWritable()
+	if timeout != 0 && !tunReadable && eventCount == 0 && !e.transmitReady && err == nil && e.controlStack.head.Load() == nil {
+		tunReadable, eventCount, err = e.platformIO.wait(e.idleTimeout(timeout), e.socketEvents)
+	}
+	if tunReadable || eventCount > 0 {
+		e.readBuffersHeld = true
+		e.idleSince = -1
+	}
 	e.engineState.Store(goEngineRunning)
 	e.refreshCoarseTime()
-	e.platformIO.drainWake()
 	return tunReadable, eventCount, err
+}
+
+func (e *goEngine) idleTimeout(timeout time.Duration) time.Duration {
+	if !e.readBuffersHeld {
+		return timeout
+	}
+	now := e.now()
+	if e.idleSince < 0 {
+		e.idleSince = now
+	}
+	releaseAt := e.idleSince + int64(goReadBufferIdle)
+	if now >= releaseAt || e.slabPool.pressureLevel() != MemoryPressureNone {
+		e.releaseReadBuffers()
+		return timeout
+	}
+	if timeout == goWaitIndefinite || time.Duration(releaseAt-now) < timeout {
+		return time.Duration(releaseAt - now)
+	}
+	return timeout
+}
+
+func (e *goEngine) releaseReadBuffers() {
+	e.readBuffersHeld = false
+	e.flushPacketUploads()
+	e.flushPacketFrames()
+	clear(e.frames)
+	e.udpUserData.packet = nil
+	clear(e.transmitFrame[:])
+	clear(e.spliceSegments[:cap(e.spliceSegments)])
+	clear(e.spliceIovecs[:cap(e.spliceIovecs)])
+	clear(e.controlSegments[:cap(e.controlSegments)])
+	buf.ReleaseMulti(e.packetReceiveBuffers[:])
+	clear(e.packetReceiveBuffers[:])
+	buf.ReleaseMulti(e.gsoBuffers[:])
+	clear(e.gsoBuffers[:])
+	clear(e.gsoSegments[:])
+	e.gsoFrame = goFrame{}
+	clear(e.packetMessages[:])
+	clear(e.packetFrames[:])
+	clear(e.packetUploads[:])
+	e.packetIO.reset()
+	e.platformIO.releaseReadBuffers()
+	for index := range e.reassemblyEntries {
+		entry := &e.reassemblyEntries[index]
+		if !entry.active {
+			entry.buffer.Release()
+			entry.buffer = nil
+		}
+	}
 }
 
 func (e *goEngine) postMessage(message *goMessage) {
@@ -356,7 +418,11 @@ func (e *goEngine) postMessage(message *goMessage) {
 }
 
 func (e *goEngine) drainControlQueue() {
-	message := e.controlStack.popAll()
+	message := e.controlStack.head.Swap(nil)
+	if message != nil {
+		e.readBuffersHeld = true
+		e.idleSince = -1
+	}
 	for message != nil {
 		next := message.next
 		message.next = nil
@@ -385,6 +451,8 @@ func (e *goEngine) handleMessage(message *goMessage) {
 		e.handleTransmitBlocked(message.conn)
 	case goMessageConnDropped:
 		e.handleDroppedFrames(message.conn)
+	case goMessageConnPacing:
+		e.handlePacingRequest(message.conn)
 	case goMessageConnSplice:
 		e.handleSpliceEngage(message.conn)
 	case goMessagePacketSplice:
@@ -402,8 +470,10 @@ func (e *goEngine) inject(packet []byte, meta ForwardFrameMeta) {
 		e.droppedInjectFrames.record(e.stack.logger, "frames handed over between queues")
 		return
 	}
-	frame := &goInjectedFrame{buffer: buf.NewSize(len(packet)), meta: meta}
+	options := e.packetReadOptions.Load()
+	frame := &goInjectedFrame{buffer: options.NewBufferSize(len(packet)), meta: meta}
 	common.Must1(frame.buffer.Write(packet))
+	options.PostReturn(frame.buffer)
 	e.injectStack.push(frame)
 	e.postMessage(&e.injectMessage)
 }
@@ -412,7 +482,9 @@ func (e *goEngine) processInjected() {
 	for frame := e.injectStack.popAll(); frame != nil; {
 		next := frame.next
 		e.injectCount.Add(-1)
-		e.processFrame(&goFrame{data: frame.buffer.Bytes(), meta: frame.meta})
+		frame.buffer = e.packetReadOptions.Load().Copy(frame.buffer)
+		e.processFrame(&goFrame{buffer: frame.buffer, meta: frame.meta})
+		e.flushPacketUploads()
 		frame.buffer.Release()
 		frame = next
 	}
@@ -438,9 +510,18 @@ func (e *goEngine) handleEngage(conn *GoConn) {
 
 func (e *goEngine) shutdown() {
 	e.closeAllPacketSplices()
+	for index := range e.reassemblyEntries {
+		e.reassemblyEntries[index].active = false
+	}
+	e.releaseReadBuffers()
 	unreset := e.closeAllFlows()
+	for conn := e.dyingList; conn != nil; conn = conn.dyingNext {
+		e.spliceDetach(conn, net.ErrClosed)
+		conn.receiveDrainable.Store(false)
+	}
 	deadline := e.now() + int64(goShutdownBudget)
 	for len(unreset) > 0 {
+		e.releaseReadBuffers()
 		remaining := deadline - e.refreshCoarseTime()
 		if remaining <= 0 {
 			break
@@ -450,7 +531,6 @@ func (e *goEngine) shutdown() {
 			time.Sleep(time.Millisecond)
 		} else {
 			e.platformIO.wait(min(time.Duration(remaining), 10*time.Millisecond), nil)
-			e.platformIO.drainWake()
 			if !e.platformIO.takeTransmitWritable() {
 				time.Sleep(time.Millisecond)
 			}
@@ -477,14 +557,15 @@ func (e *goEngine) processBurst() error {
 	budget := goEngineBurstBytes
 	e.tunPending = false
 	for remaining > 0 && budget > 0 {
-		count, drained, err := e.platformIO.readBurst(e.frames[:remaining])
+		count, drained, err := e.platformIO.readBurst(e.frames[:remaining], *e.packetReadOptions.Load())
 		if err != nil {
 			return err
 		}
 		for index := range count {
-			budget -= len(e.frames[index].data)
+			budget -= e.frames[index].buffer.Len()
 			e.processFrame(&e.frames[index])
 		}
+		e.flushPacketUploads()
 		if drained || count == 0 {
 			return nil
 		}
@@ -495,7 +576,11 @@ func (e *goEngine) processBurst() error {
 }
 
 func (e *goEngine) processFrame(frame *goFrame) {
-	parsed, ok := parseForwardPacket(frame.data)
+	if frame.meta.gsoType == goUDPGSOType {
+		e.processUDPSegments(frame)
+		return
+	}
+	parsed, ok := parseForwardPacket(frame.buffer.Bytes())
 	if !ok {
 		return
 	}
@@ -503,15 +588,26 @@ func (e *goEngine) processFrame(frame *goFrame) {
 		return
 	}
 	if parsed.fragment {
-		e.reassemble(frame.data, &parsed)
+		e.reassemble(frame.buffer.Bytes(), &parsed)
 		return
 	}
-	e.processParsed(frame.data, frame.meta, &parsed)
+	e.processParsed(frame.buffer, frame.meta, &parsed)
 }
 
-func (e *goEngine) processParsed(packet []byte, meta ForwardFrameMeta, parsed *forwardPacket) {
+func (e *goEngine) processParsed(buffer *buf.Buffer, meta ForwardFrameMeta, parsed *forwardPacket) {
+	packet := buffer.Bytes()
 	if e.handleLoopbackHairpin(packet, meta, parsed) {
 		return
+	}
+	if parsed.protocol == uint8(header.UDPProtocolNumber) && parsed.hasFlow {
+		writer := e.packetFlows[parsed.flowKey()]
+		if writer != nil && writer.splice != nil {
+			conn := writer.conn.Load()
+			if conn != nil && !conn.isClosed() && conn.service.state.Load() == udpNatStateStarted {
+				e.packetSpliceInput(writer, buffer, parsed)
+				return
+			}
+		}
 	}
 	establishedTCP := parsed.protocol == uint8(header.TCPProtocolNumber) && parsed.hasFlow && !parsed.isPureTCPSyn()
 	if establishedTCP {
@@ -531,17 +627,17 @@ func (e *goEngine) processParsed(packet []byte, meta ForwardFrameMeta, parsed *f
 			return
 		}
 	}
-	e.demuxL4(packet, meta, parsed)
+	e.demuxL4(buffer, meta, parsed)
 }
 
-func (e *goEngine) demuxL4(packet []byte, meta ForwardFrameMeta, parsed *forwardPacket) {
+func (e *goEngine) demuxL4(buffer *buf.Buffer, meta ForwardFrameMeta, parsed *forwardPacket) {
 	switch parsed.protocol {
 	case uint8(header.TCPProtocolNumber):
-		e.demuxTCP(packet, parsed)
+		e.demuxTCP(buffer.Bytes(), parsed)
 	case uint8(header.UDPProtocolNumber):
-		e.demuxUDP(packet, meta, parsed)
+		e.demuxUDP(buffer, meta, parsed)
 	case uint8(header.ICMPv4ProtocolNumber), uint8(header.ICMPv6ProtocolNumber):
-		e.answerEcho(packet, parsed)
+		e.answerEcho(buffer.Bytes(), parsed)
 	}
 }
 
@@ -588,8 +684,12 @@ func (e *goEngine) now() int64 {
 	return e.coarseTime.Load()
 }
 
+func (e *goEngine) readClock() int64 {
+	return int64(time.Since(e.epoch))
+}
+
 func (e *goEngine) refreshCoarseTime() int64 {
-	now := int64(time.Since(e.epoch))
+	now := e.readClock()
 	e.coarseTime.Store(now)
 	return now
 }
@@ -617,7 +717,8 @@ type goReassemblyEntry struct {
 	deadline     int64
 	headerLength int
 	totalLength  int
-	buffer       []byte
+	buffer       *buf.Buffer
+	headroom     int
 	ranges       [goReassemblyMaxRanges]goReassemblyRange
 	rangeCount   int
 }
@@ -639,7 +740,7 @@ func (e *goEngine) reassembleIPv4(packet []byte, parsed *forwardPacket) {
 	entry := e.reassemblyEntry(4, uint8(ipHdr.TransportProtocol()), parsed.source.Addr(), parsed.destination.Addr(), uint32(ipHdr.ID()))
 	offset := int(ipHdr.FragmentOffset())
 	if offset == 0 {
-		copy(entry.buffer[goReassemblyHeadroom-headerLength:], packet[:headerLength])
+		copy(entry.buffer.Range(entry.headroom-headerLength, entry.headroom), packet[:headerLength])
 		entry.headerLength = headerLength
 		entry.headerSeen = true
 	}
@@ -657,7 +758,7 @@ func (e *goEngine) reassembleIPv6(packet []byte, parsed *forwardPacket) {
 	}
 	entry := e.reassemblyEntry(6, fragHdr.NextHeader(), parsed.source.Addr(), parsed.destination.Addr(), fragHdr.ID())
 	if !entry.headerSeen {
-		copy(entry.buffer[goReassemblyHeadroom-header.IPv6MinimumSize:], packet[:header.IPv6MinimumSize])
+		copy(entry.buffer.Range(entry.headroom-header.IPv6MinimumSize, entry.headroom), packet[:header.IPv6MinimumSize])
 		entry.headerLength = header.IPv6MinimumSize
 		entry.headerSeen = true
 	}
@@ -691,9 +792,15 @@ func (e *goEngine) reassemblyEntry(ipVersion uint8, protocol uint8, source netip
 	if entry == nil {
 		entry = oldest
 	}
-	if entry.buffer == nil {
-		entry.buffer = make([]byte, goReassemblyCapacity)
+	options := e.packetReadOptions.Load()
+	bufferSize := options.FrontHeadroom + goReassemblyCapacity + options.RearHeadroom
+	if entry.buffer == nil || entry.buffer.RawCap() < bufferSize {
+		entry.buffer.Release()
+		entry.buffer = buf.NewSize(bufferSize)
+	} else {
+		entry.buffer.Reset()
 	}
+	entry.headroom = options.FrontHeadroom + goReassemblyHeadroom
 	entry.active = true
 	entry.headerSeen = false
 	entry.ipVersion = ipVersion
@@ -731,7 +838,7 @@ func (e *goEngine) reassemblyAdd(entry *goReassemblyEntry, offset int, fragment 
 		entry.active = false
 		return
 	}
-	copy(entry.buffer[goReassemblyHeadroom+offset:], fragment)
+	copy(entry.buffer.Range(entry.headroom+offset, entry.headroom+end), fragment)
 	if !reassemblyMergeRanges(entry, offset, end) {
 		entry.active = false
 		return
@@ -775,7 +882,9 @@ func (e *goEngine) completeReassembly(entry *goReassemblyEntry) {
 	if entry.ipVersion == 4 && entry.headerLength+entry.totalLength > 65535 {
 		return
 	}
-	packet := entry.buffer[goReassemblyHeadroom-entry.headerLength : goReassemblyHeadroom+entry.totalLength]
+	buffer := entry.buffer
+	buffer.Resize(entry.headroom-entry.headerLength, entry.headerLength+entry.totalLength)
+	packet := buffer.Bytes()
 	if entry.ipVersion == 4 {
 		ipHdr := header.IPv4(packet)
 		ipHdr.SetTotalLength(uint16(len(packet)))
@@ -791,7 +900,8 @@ func (e *goEngine) completeReassembly(entry *goReassemblyEntry) {
 	if !ok || parsed.fragment {
 		return
 	}
-	e.processParsed(packet, ForwardFrameMeta{}, &parsed)
+	e.processParsed(buffer, ForwardFrameMeta{}, &parsed)
+	e.flushPacketUploads()
 }
 
 func (e *goEngine) expireReassemblyTick(now int64) {
@@ -803,11 +913,40 @@ func (e *goEngine) expireReassemblyTick(now int64) {
 		}
 		if entry.deadline <= now {
 			entry.active = false
+			if !e.readBuffersHeld {
+				entry.buffer.Release()
+				entry.buffer = nil
+			}
 		} else {
 			next = min(next, entry.deadline)
 		}
 	}
 	if next != math.MaxInt64 {
 		e.wheel.schedule(&e.reassemblyTickNode, next)
+	}
+}
+
+func (e *goEngine) answerEcho(packet []byte, parsed *forwardPacket) {
+	switch parsed.protocol {
+	case uint8(header.ICMPv4ProtocolNumber):
+		if len(parsed.transport) < header.ICMPv4MinimumSize {
+			return
+		}
+		if !rewriteEchoReplyIPv4(header.IPv4(parsed.network), header.ICMPv4(parsed.transport)) {
+			return
+		}
+	case uint8(header.ICMPv6ProtocolNumber):
+		if len(parsed.transport) < header.ICMPv6MinimumSize {
+			return
+		}
+		if !rewriteEchoReplyIPv6(header.IPv6(parsed.network), header.ICMPv6(parsed.transport)) {
+			return
+		}
+	default:
+		return
+	}
+	err := e.platformIO.writeFrame(e.singleFrame(packet), ForwardFrameMeta{})
+	if err != nil {
+		e.stack.logger.Trace(E.Cause(err, "go: write echo reply"))
 	}
 }

@@ -2,6 +2,7 @@ package tun
 
 import (
 	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -22,6 +23,7 @@ type goSlabPool struct {
 	holders  atomic.Int32
 	pressure func() MemoryPressure
 	lowWater int
+	closed   bool
 }
 
 func newGoSlabPool(pressure func() MemoryPressure, lowWater int) *goSlabPool {
@@ -54,14 +56,26 @@ func (p *goSlabPool) acquire() *goSlab {
 }
 
 func (p *goSlabPool) release(slab *goSlab) {
-	if p.pressureLevel() != MemoryPressureNone {
-		goFreeSlab(slab)
-	} else {
-		p.access.Lock()
+	p.access.Lock()
+	if !p.closed && p.pressureLevel() == MemoryPressureNone {
 		p.free = append(p.free, slab)
 		p.access.Unlock()
+	} else {
+		p.access.Unlock()
+		goFreeSlab(slab)
 	}
 	p.inUse.Add(-1)
+}
+
+func (p *goSlabPool) close() {
+	p.access.Lock()
+	p.closed = true
+	free := p.free
+	p.free = nil
+	p.access.Unlock()
+	for _, slab := range free {
+		goFreeSlab(slab)
+	}
 }
 
 func (p *goSlabPool) trim() {
@@ -107,18 +121,15 @@ func (h *goSlabHolder) heldBytes() uint64 {
 	return uint64(h.held.Load()) * goSlabSize
 }
 
+const goSlabChainMinSlots = 4
+
 type goSlabChain struct {
-	slots         []*goSlab
+	slots         atomic.Pointer[[]*goSlab]
 	pool          *goSlabPool
 	holder        *goSlabHolder
 	held          atomic.Int32
+	maxSlots      uint32
 	releasedIndex uint64
-}
-
-func (c *goSlabChain) init(slots []*goSlab, pool *goSlabPool, holder *goSlabHolder) {
-	c.slots = slots
-	c.pool = pool
-	c.holder = holder
 }
 
 func (c *goSlabChain) acquire() *goSlab {
@@ -142,25 +153,49 @@ func (c *goSlabChain) heldBytes() uint64 {
 	return uint64(c.held.Load()) * goSlabSize
 }
 
-func (c *goSlabChain) slotOf(offset uint64) int {
-	return int((offset / goSlabSize) % uint64(len(c.slots)))
+func (c *goSlabChain) loadSlots() []*goSlab {
+	slots := c.slots.Load()
+	if slots == nil {
+		return nil
+	}
+	return *slots
+}
+
+func (c *goSlabChain) ensure(last uint64) []*goSlab {
+	slots := c.loadSlots()
+	required := last - c.releasedIndex + 1
+	if required <= uint64(len(slots)) {
+		return slots
+	}
+	grown := make([]*goSlab, max(required, min(max(2*uint64(len(slots)), goSlabChainMinSlots), uint64(c.maxSlots))))
+	for index := c.releasedIndex; index < c.releasedIndex+uint64(len(slots)); index++ {
+		grown[index%uint64(len(grown))] = slots[index%uint64(len(slots))]
+	}
+	c.slots.Store(&grown)
+	return grown
+}
+
+func goSlotOf(slots []*goSlab, offset uint64) int {
+	return int((offset / goSlabSize) % uint64(len(slots)))
 }
 
 func (c *goSlabChain) reserve(offset uint64, length int) {
 	first := offset / goSlabSize
 	last := (offset + uint64(length) - 1) / goSlabSize
+	slots := c.ensure(last)
 	for index := first; index <= last; index++ {
-		slot := int(index % uint64(len(c.slots)))
-		if c.slots[slot] != nil {
+		slot := int(index % uint64(len(slots)))
+		if slots[slot] != nil {
 			continue
 		}
-		c.slots[slot] = c.acquire()
+		slots[slot] = c.acquire()
 	}
 }
 
 func (c *goSlabChain) writeAt(offset uint64, data []byte) {
+	slots := c.loadSlots()
 	for len(data) > 0 {
-		slab := c.slots[c.slotOf(offset)]
+		slab := slots[goSlotOf(slots, offset)]
 		start := int(offset % goSlabSize)
 		n := copy(slab[start:], data)
 		data = data[n:]
@@ -169,9 +204,10 @@ func (c *goSlabChain) writeAt(offset uint64, data []byte) {
 }
 
 func (c *goSlabChain) readAt(offset uint64, target []byte) {
+	slots := c.loadSlots()
 	copied := 0
 	for copied < len(target) {
-		slab := c.slots[c.slotOf(offset)]
+		slab := slots[goSlotOf(slots, offset)]
 		start := int(offset % goSlabSize)
 		n := copy(target[copied:], slab[start:])
 		copied += n
@@ -180,8 +216,9 @@ func (c *goSlabChain) readAt(offset uint64, target []byte) {
 }
 
 func (c *goSlabChain) appendRuns(segments [][]byte, offset uint64, length int) [][]byte {
+	slots := c.loadSlots()
 	for length > 0 {
-		slab := c.slots[c.slotOf(offset)]
+		slab := slots[goSlotOf(slots, offset)]
 		start := int(offset % goSlabSize)
 		n := min(goSlabSize-start, length)
 		segments = append(segments, slab[start:start+n])
@@ -191,38 +228,47 @@ func (c *goSlabChain) appendRuns(segments [][]byte, offset uint64, length int) [
 	return segments
 }
 
+func (c *goSlabChain) releaseRange(first uint64, last uint64) {
+	slots := c.loadSlots()
+	if len(slots) == 0 {
+		return
+	}
+	for index := first; index <= last; index++ {
+		slot := int(index % uint64(len(slots)))
+		slab := slots[slot]
+		if slab == nil {
+			continue
+		}
+		slots[slot] = nil
+		c.release(slab)
+	}
+}
+
 func (c *goSlabChain) releaseBelow(offset uint64) {
 	target := offset / goSlabSize
-	for index := c.releasedIndex; index < target; index++ {
-		slot := int(index % uint64(len(c.slots)))
-		slab := c.slots[slot]
-		if slab != nil {
-			c.slots[slot] = nil
-			c.release(slab)
-		}
+	if target <= c.releasedIndex {
+		return
 	}
-	if target > c.releasedIndex {
-		c.releasedIndex = target
+	slots := c.loadSlots()
+	end := min(target, c.releasedIndex+uint64(len(slots)))
+	if end > c.releasedIndex {
+		c.releaseRange(c.releasedIndex, end-1)
 	}
+	c.releasedIndex = target
 }
 
 func (c *goSlabChain) releaseDrained(offset uint64) {
 	c.releaseBelow(offset)
-	slot := c.slotOf(offset)
-	slab := c.slots[slot]
-	if slab == nil {
-		return
-	}
-	c.slots[slot] = nil
-	c.release(slab)
+	c.releaseRange(offset/goSlabSize, offset/goSlabSize)
 }
 
 func (c *goSlabChain) releaseAll() {
-	for slot, slab := range c.slots {
+	slots := c.loadSlots()
+	for slot, slab := range slots {
 		if slab == nil {
 			continue
 		}
-		c.slots[slot] = nil
+		slots[slot] = nil
 		c.release(slab)
 	}
 }
@@ -243,11 +289,6 @@ type goTransmitStore struct {
 	reserveTail uint64
 }
 
-func (s *goTransmitStore) init(slots []*goSlab, pool *goSlabPool, holder *goSlabHolder) {
-	s.chain.init(slots, pool, holder)
-	s.runs = s.runs[:0]
-}
-
 func (s *goTransmitStore) reserve(offset uint64, length int) {
 	s.access.Lock()
 	defer s.access.Unlock()
@@ -263,14 +304,8 @@ func (s *goTransmitStore) shrinkReserve(tail uint64) {
 	}
 	first := (tail + goSlabSize - 1) / goSlabSize
 	last := (s.reserveTail - 1) / goSlabSize
-	for index := first; index <= last; index++ {
-		slot := int(index % uint64(len(s.chain.slots)))
-		slab := s.chain.slots[slot]
-		if slab == nil {
-			continue
-		}
-		s.chain.slots[slot] = nil
-		s.chain.release(slab)
+	if first <= last {
+		s.chain.releaseRange(first, last)
 	}
 	s.reserveTail = tail
 }
@@ -278,7 +313,8 @@ func (s *goTransmitStore) shrinkReserve(tail uint64) {
 func (s *goTransmitStore) writeAt(offset uint64, data []byte) {
 	for len(data) > 0 {
 		s.access.Lock()
-		slab := s.chain.slots[s.chain.slotOf(offset)]
+		slots := s.chain.loadSlots()
+		slab := slots[goSlotOf(slots, offset)]
 		s.access.Unlock()
 		start := int(offset % goSlabSize)
 		n := copy(slab[start:], data)
@@ -385,51 +421,71 @@ func (s *goTransmitStore) releaseAll() {
 }
 
 const (
-	goDescriptorRetransmitted uint8 = 1 << iota
+	goDescriptorRetransmitted uint16 = 1 << iota
 	goDescriptorNoSample
 	goDescriptorSacked
 	goDescriptorDropped
 	goDescriptorAmend
+	goDescriptorRetransmitOut
+	goDescriptorRated
+	goDescriptorAppLimited
+	goDescriptorTxStart
+	goDescriptorLost
 )
 
 type goSentDescriptor struct {
-	endOffset uint64
-	sentAt    int32
-	flags     uint8
-	_         [3]byte
+	endOffset      uint64
+	sentAt         int32
+	deliveredStamp int32
+	firstSentStamp int32
+	delivered      uint32
+	flags          uint16
+	_              [2]byte
 }
 
+const (
+	goDescriptorBlockCapacity  = 64
+	goScoreboardInlineCapacity = 16
+)
+
+type goDescriptorBlock [goDescriptorBlockCapacity]goSentDescriptor
+
+// The producer publishes entries through tail; the engine consumes them through
+// head. Blocks are allocated on demand and returned after their final entry is
+// consumed. The directory stays fixed so neither side has to resize shared state.
 type goDescriptorRing struct {
-	entries       []goSentDescriptor
-	head          atomic.Uint32
-	tail          atomic.Uint32
-	pending       goSentDescriptor
-	pendingActive bool
+	blocks         [goDescriptorRingCapacity / goDescriptorBlockCapacity]atomic.Pointer[goDescriptorBlock]
+	pool           *goDescriptorPool
+	head           atomic.Uint32
+	tail           atomic.Uint32
+	overflowed     atomic.Bool
+	overflowAccess sync.Mutex
+	overflow       []goSentDescriptor
 }
 
 type goDescriptorPool struct {
 	access   sync.Mutex
-	free     [][]goSentDescriptor
+	free     []*goDescriptorBlock
 	lowWater int
 }
 
-func (p *goDescriptorPool) acquire() []goSentDescriptor {
+func (p *goDescriptorPool) acquire() *goDescriptorBlock {
 	p.access.Lock()
 	index := len(p.free) - 1
 	if index >= 0 {
-		entries := p.free[index]
+		block := p.free[index]
 		p.free[index] = nil
 		p.free = p.free[:index]
 		p.access.Unlock()
-		return entries
+		return block
 	}
 	p.access.Unlock()
-	return make([]goSentDescriptor, goDescriptorRingCapacity)
+	return new(goDescriptorBlock)
 }
 
-func (p *goDescriptorPool) release(entries []goSentDescriptor) {
+func (p *goDescriptorPool) release(block *goDescriptorBlock) {
 	p.access.Lock()
-	p.free = append(p.free, entries)
+	p.free = append(p.free, block)
 	p.access.Unlock()
 }
 
@@ -444,83 +500,123 @@ func (p *goDescriptorPool) trim() {
 	p.free = p.free[:target]
 }
 
-func (r *goDescriptorRing) reset(entries []goSentDescriptor) {
-	r.entries = entries
+// release requires exclusive access to both sides of the ring. For a live
+// connection the engine holds transmitOwner and checks that all sent data is ACKed.
+func (r *goDescriptorRing) release() {
+	for index := range r.blocks {
+		if block := r.blocks[index].Swap(nil); block != nil {
+			r.pool.release(block)
+		}
+	}
 	r.head.Store(0)
 	r.tail.Store(0)
-	r.pending = goSentDescriptor{}
-	r.pendingActive = false
+	r.overflow = nil
+	r.overflowed.Store(false)
 }
 
-func (r *goDescriptorRing) push(endOffset uint64, sentAt int32, flags uint8) {
-	if flags&goDescriptorAmend != 0 {
-		r.pushAmendment(endOffset, sentAt, flags)
+func (r *goDescriptorRing) push(entry goSentDescriptor) {
+	if !r.overflowed.Load() && r.store(entry) {
 		return
 	}
-	if r.pendingActive {
-		r.pending.endOffset = endOffset
-		r.pending.sentAt = sentAt
-		r.pending.flags |= flags
-	} else {
-		r.pending = goSentDescriptor{endOffset: endOffset, sentAt: sentAt, flags: flags}
-		r.pendingActive = true
+	r.overflowAccess.Lock()
+	defer r.overflowAccess.Unlock()
+	if !r.overflowed.Load() && r.store(entry) {
+		return
 	}
-	if r.store(r.pending) {
-		r.pendingActive = false
-	}
-}
-
-func (r *goDescriptorRing) pushAmendment(endOffset uint64, length int32, flags uint8) {
-	if r.pendingActive {
-		if !r.store(r.pending) {
+	if entry.flags&goDescriptorAmend != 0 && len(r.overflow) > 0 {
+		last := &r.overflow[len(r.overflow)-1]
+		if last.flags&goDescriptorAmend != 0 && last.endOffset == entry.endOffset && last.sentAt == entry.sentAt {
+			last.flags |= entry.flags
 			return
 		}
-		r.pendingActive = false
 	}
-	r.store(goSentDescriptor{endOffset: endOffset, sentAt: length, flags: flags})
+	r.overflow = append(r.overflow, entry)
+	r.overflowed.Store(true)
 }
 
 func (r *goDescriptorRing) store(entry goSentDescriptor) bool {
 	tail := r.tail.Load()
-	if tail-r.head.Load() >= uint32(len(r.entries)) {
+	if tail-r.head.Load() >= goDescriptorRingCapacity {
 		return false
 	}
-	r.entries[tail%uint32(len(r.entries))] = entry
+	slot := &r.blocks[tail/goDescriptorBlockCapacity%uint32(len(r.blocks))]
+	block := slot.Load()
+	// A wrapped producer must not reuse the consumed prefix of a block that
+	// the consumer still owns; the consumer releases whole blocks.
+	if tail%goDescriptorBlockCapacity == 0 && block != nil {
+		return false
+	}
+	if block == nil {
+		block = r.pool.acquire()
+		slot.Store(block)
+	}
+	block[tail%goDescriptorBlockCapacity] = entry
 	r.tail.Store(tail + 1)
 	return true
 }
 
-func (r *goDescriptorRing) at(index uint32) *goSentDescriptor {
-	return &r.entries[index%uint32(len(r.entries))]
+func (r *goDescriptorRing) take(index uint32) goSentDescriptor {
+	slot := &r.blocks[index/goDescriptorBlockCapacity%uint32(len(r.blocks))]
+	block := slot.Load()
+	entry := block[index%goDescriptorBlockCapacity]
+	if (index+1)%goDescriptorBlockCapacity == 0 {
+		slot.Store(nil)
+		r.pool.release(block)
+	}
+	return entry
 }
 
 type goScoreboard struct {
 	entries []goSentDescriptor
+	inline  [goScoreboardInlineCapacity]goSentDescriptor
+}
+
+func (s *goScoreboard) append(entry goSentDescriptor) {
+	if s.entries == nil {
+		s.entries = s.inline[:0]
+	}
+	s.entries = append(s.entries, entry)
 }
 
 func (s *goScoreboard) drain(ring *goDescriptorRing, unacked uint64) {
+	s.drainRing(ring, unacked)
+	if !ring.overflowed.Load() {
+		return
+	}
+	ring.overflowAccess.Lock()
+	defer ring.overflowAccess.Unlock()
+	s.drainRing(ring, unacked)
+	for _, entry := range ring.overflow {
+		s.drainEntry(entry, unacked)
+	}
+	ring.overflow = ring.overflow[:0]
+	ring.overflowed.Store(false)
+}
+
+func (s *goScoreboard) drainRing(ring *goDescriptorRing, unacked uint64) {
 	head := ring.head.Load()
 	tail := ring.tail.Load()
-	for head < tail {
-		entry := *ring.at(head)
+	for head != tail {
+		entry := ring.take(head)
 		head++
-		if entry.flags&goDescriptorAmend != 0 {
-			s.amend(entry.endOffset-uint64(entry.sentAt), entry.endOffset, entry.flags&^goDescriptorAmend)
-			continue
-		}
-		if entry.endOffset > unacked {
-			s.entries = append(s.entries, entry)
-		}
+		s.drainEntry(entry, unacked)
 	}
 	ring.head.Store(head)
 }
 
-func (s *goScoreboard) amend(start uint64, end uint64, flags uint8) {
-	for index := range s.entries {
+func (s *goScoreboard) drainEntry(entry goSentDescriptor, unacked uint64) {
+	if entry.flags&goDescriptorAmend != 0 {
+		s.amend(entry.endOffset-uint64(entry.sentAt), entry.endOffset, entry.flags&^goDescriptorAmend)
+	} else if entry.endOffset > unacked {
+		s.append(entry)
+	}
+}
+
+func (s *goScoreboard) amend(start uint64, end uint64, flags uint16) {
+	first := sort.Search(len(s.entries), func(index int) bool { return s.entries[index].endOffset > start })
+	for index := first; index < len(s.entries) && s.entries[index].endOffset <= end; index++ {
 		entry := &s.entries[index]
-		if entry.endOffset > start && entry.endOffset <= end {
-			entry.flags |= flags
-		}
+		entry.flags |= flags
 	}
 }
 
@@ -548,13 +644,19 @@ func (s *goScoreboard) split(index int, offset uint64) {
 	if entry.endOffset == offset {
 		return
 	}
-	s.entries = append(s.entries, goSentDescriptor{})
+	s.append(goSentDescriptor{})
 	copy(s.entries[index+1:], s.entries[index:len(s.entries)-1])
 	s.entries[index].endOffset = offset
 }
 
 func (s *goScoreboard) reset() {
-	s.entries = s.entries[:0]
+	s.entries = nil
+}
+
+func (s *goScoreboard) trim() {
+	if len(s.entries) == 0 && cap(s.entries) > goScoreboardInlineCapacity {
+		s.entries = nil
+	}
 }
 
 const goMaxSackBlocks = 4
@@ -578,11 +680,6 @@ type goRangeSet struct {
 	ranges [goMaxOOORanges]goRange
 	count  int
 	recent [3]uint64
-}
-
-func (s *goRangeSet) reset() {
-	s.count = 0
-	s.recent = [3]uint64{}
 }
 
 func (s *goRangeSet) insert(start uint64, end uint64, fin bool) bool {
@@ -635,7 +732,7 @@ func (s *goRangeSet) first() (goRange, bool) {
 func (s *goRangeSet) removeBelow(offset uint64) {
 	kept := 0
 	for index := range s.count {
-		if s.ranges[index].end <= offset {
+		if s.ranges[index].end < offset || s.ranges[index].end == offset && !s.ranges[index].fin {
 			continue
 		}
 		s.ranges[kept] = s.ranges[index]
@@ -647,13 +744,15 @@ func (s *goRangeSet) removeBelow(offset uint64) {
 	s.count = kept
 }
 
-func (s *goRangeSet) covers(start uint64, end uint64) bool {
+func (s *goRangeSet) overlap(start uint64, end uint64) (uint64, uint64, bool) {
 	for index := range s.count {
-		if s.ranges[index].start <= start && end <= s.ranges[index].end {
-			return true
+		candidate := s.ranges[index]
+		if candidate.end <= start || candidate.start >= end {
+			continue
 		}
+		return max(start, candidate.start), min(end, candidate.end), true
 	}
-	return false
+	return 0, 0, false
 }
 
 func (s *goRangeSet) bytes() uint64 {
@@ -670,10 +769,10 @@ func (s *goRangeSet) blocks(out *[goMaxSackBlocks]goSackBlock, base int) int {
 		if emitted == goMaxSackBlocksSent {
 			break
 		}
-		if start == 0 {
+		if start == 0 || slices.ContainsFunc(out[base:emitted], func(block goSackBlock) bool { return block.start == start }) {
 			continue
 		}
-		found := slices.IndexFunc(s.ranges[:s.count], func(candidate goRange) bool { return candidate.start == start })
+		found := slices.IndexFunc(s.ranges[:s.count], func(candidate goRange) bool { return candidate.start == start && candidate.end > start })
 		if found < 0 {
 			continue
 		}
@@ -682,7 +781,7 @@ func (s *goRangeSet) blocks(out *[goMaxSackBlocks]goSackBlock, base int) int {
 	}
 	for index := 0; index < s.count && emitted < goMaxSackBlocksSent; index++ {
 		start := s.ranges[index].start
-		if slices.ContainsFunc(out[base:emitted], func(block goSackBlock) bool { return block.start == start }) {
+		if start == s.ranges[index].end || slices.ContainsFunc(out[base:emitted], func(block goSackBlock) bool { return block.start == start }) {
 			continue
 		}
 		out[emitted] = goSackBlock{start: s.ranges[index].start, end: s.ranges[index].end}

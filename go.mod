@@ -30,3 +30,5 @@ require (
 	golang.org/x/time v0.15.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/sagernet/sing => github.com/Capricornus007/sing v0.9.4-0.20260915105322-987a74fd832a

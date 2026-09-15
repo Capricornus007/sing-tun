@@ -7,14 +7,14 @@ import (
 	"unsafe"
 
 	"github.com/sagernet/sing-tun/internal/afd"
+	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
+	N "github.com/sagernet/sing/common/network"
 
 	"golang.org/x/sys/windows"
 )
 
 const goEngineInlineTransmit = false
-
-const goSessionRingCapacity = 0x800000
 
 const (
 	goCompletionKeyTun uintptr = iota + 1
@@ -25,18 +25,19 @@ const (
 const goAFDReadEvents = afd.POLL_RECEIVE | afd.POLL_DISCONNECT | afd.POLL_ABORT | afd.POLL_LOCAL_CLOSE | afd.POLL_CONNECT_FAIL
 
 type goWindowsIO struct {
-	stack        *Go
-	tun          *NativeTun
-	iocp         windows.Handle
-	afd          *afd.Device
-	waitPacket   *afd.WaitCompletionPacket
-	waitArmed    bool
-	bridgeArm    windows.Handle
-	bridgeClose  windows.Handle
-	bridgeDone   chan struct{}
-	entries      map[*goAFDEntry]struct{}
-	completions  [goSocketEventBatch + 2]afd.OverlappedEntry
-	receiveSlots [][]byte
+	stack           *Go
+	tun             *NativeTun
+	iocp            windows.Handle
+	afd             *afd.Device
+	waitPacket      *afd.WaitCompletionPacket
+	waitArmed       bool
+	bridgeArm       windows.Handle
+	bridgeClose     windows.Handle
+	bridgeDone      chan struct{}
+	entries         map[*goAFDEntry]struct{}
+	completions     [goSocketEventBatch + 2]afd.OverlappedEntry
+	receiveBuffers  []*buf.Buffer
+	readWaitOptions N.ReadWaitOptions
 	// wintun's read-wait event is auto-reset and only set by the driver when it appends to
 	// the ring; WintunReceivePacket neither re-signals nor resets it (wintun api/session.c:
 	// CreateEventW(&SecurityAttributes, FALSE, FALSE, NULL)).
@@ -46,8 +47,8 @@ type goWindowsIO struct {
 	droppedDataFrames   goDropCounter
 }
 
-func newGoPlatformIO(stack *Go) (goPlatformIO, error) {
-	return &goWindowsIO{stack: stack}, nil
+func newGoPlatformQueues(stack *Go) ([]goPlatformIO, error) {
+	return []goPlatformIO{&goWindowsIO{stack: stack}}, nil
 }
 
 func (o *goWindowsIO) start() error {
@@ -56,10 +57,6 @@ func (o *goWindowsIO) start() error {
 		return E.New("go: unsupported TUN implementation")
 	}
 	o.tun = nativeTun
-	err := nativeTun.resizeSessionRing(goSessionRingCapacity)
-	if err != nil {
-		return E.Cause(err, "go: resize wintun session ring")
-	}
 	iocp, err := windows.CreateIoCompletionPort(windows.InvalidHandle, 0, 0, 1)
 	if err != nil {
 		return E.Cause(err, "go: create completion port")
@@ -99,12 +96,6 @@ func (o *goWindowsIO) start() error {
 		go o.bridgeReadWait()
 	}
 	o.entries = make(map[*goAFDEntry]struct{})
-	slotSize := o.stack.mtu
-	storage := make([]byte, goReadBatch*slotSize)
-	o.receiveSlots = make([][]byte, goReadBatch)
-	for index := range goReadBatch {
-		o.receiveSlots[index] = storage[index*slotSize : (index+1)*slotSize]
-	}
 	o.ringDrained = true
 	return nil
 }
@@ -168,12 +159,12 @@ func (o *goWindowsIO) wait(timeout time.Duration, events []goSocketEvent) (bool,
 		waitMillis = uint32((timeout + time.Millisecond - 1) / time.Millisecond)
 	}
 	var removed uint32
-	err := afd.GetQueuedCompletionStatusEx(o.iocp, &o.completions[0], uint32(len(o.completions)), &removed, waitMillis, false)
-	if err != nil {
-		if err == windows.WAIT_TIMEOUT {
+	errno := afd.GetQueuedCompletionStatusEx(o.iocp, &o.completions[0], uint32(len(o.completions)), &removed, waitMillis, false)
+	if errno != 0 {
+		if errno == windows.WAIT_TIMEOUT {
 			return tunReadable, 0, nil
 		}
-		return false, 0, E.Cause(err, "go: wait for completion")
+		return false, 0, E.Cause(errno, "go: wait for completion")
 	}
 	socketCount := 0
 	for index := range removed {
@@ -293,11 +284,26 @@ func (o *goWindowsIO) unregisterSocket(socket *goSocket) {
 	o.afd.Cancel(&entry.ioStatusBlock)
 }
 
-func (o *goWindowsIO) readBurst(frames []goFrame) (int, bool, error) {
-	limit := min(len(frames), len(o.receiveSlots))
+func (o *goWindowsIO) readBurst(frames []goFrame, options N.ReadWaitOptions) (int, bool, error) {
+	if o.receiveBuffers == nil || o.readWaitOptions != options {
+		o.releaseReadBuffers()
+		if o.receiveBuffers == nil {
+			o.receiveBuffers = make([]*buf.Buffer, goReadBatch)
+		}
+		o.readWaitOptions = options
+	}
+	limit := min(len(frames), len(o.receiveBuffers))
 	count := 0
 	for count < limit {
-		n, err := o.tun.receiveInto(o.receiveSlots[count])
+		buffer := o.receiveBuffers[count]
+		if buffer == nil {
+			buffer = options.NewBufferSize(o.stack.mtu)
+			o.receiveBuffers[count] = buffer
+		}
+		buffer.Reset()
+		buffer.Resize(options.FrontHeadroom, 0)
+		buffer.Reserve(options.RearHeadroom)
+		n, err := o.tun.receiveInto(buffer.FreeBytes())
 		if err != nil {
 			return 0, false, err
 		}
@@ -305,7 +311,9 @@ func (o *goWindowsIO) readBurst(frames []goFrame) (int, bool, error) {
 			o.ringDrained = true
 			return count, true, nil
 		}
-		frames[count] = goFrame{data: o.receiveSlots[count][:n]}
+		buffer.Truncate(n)
+		options.PostReturn(buffer)
+		frames[count] = goFrame{buffer: buffer}
 		count++
 	}
 	o.ringDrained = false
@@ -316,6 +324,26 @@ func goFatalReadError(err error) bool {
 	return true
 }
 
+func (o *goWindowsIO) releaseReadBuffers() {
+	buf.ReleaseMulti(o.receiveBuffers)
+	clear(o.receiveBuffers)
+}
+
+func (o *goWindowsIO) writePacketBatch(frames []goUDPFrame) error {
+	var writeError error
+	var segments [2][]byte
+	for index := range frames {
+		frame := &frames[index]
+		segments[0] = frame.header[:frame.length]
+		segments[1] = frame.payload
+		err := o.writeFrame(segments[:], frame.meta)
+		if err != nil {
+			writeError = E.Errors(writeError, err)
+		}
+	}
+	return writeError
+}
+
 func (o *goWindowsIO) writeFrame(frame [][]byte, meta ForwardFrameMeta) error {
 	err := o.transmitFrame(frame)
 	if err == windows.ERROR_BUFFER_OVERFLOW {
@@ -323,6 +351,11 @@ func (o *goWindowsIO) writeFrame(frame [][]byte, meta ForwardFrameMeta) error {
 		return errGoFrameDropped
 	}
 	return err
+}
+
+func (o *goWindowsIO) writePacket(packet []byte, meta ForwardFrameMeta) error {
+	frame := [1][]byte{packet}
+	return o.writeFrame(frame[:], meta)
 }
 
 func (o *goWindowsIO) writeData(frame [][]byte, meta ForwardFrameMeta) error {
@@ -376,9 +409,6 @@ func (o *goWindowsIO) takeTransmitWritable() bool {
 
 func (o *goWindowsIO) wake() {
 	_ = windows.PostQueuedCompletionStatus(o.iocp, 0, goCompletionKeyWake, nil)
-}
-
-func (o *goWindowsIO) drainWake() {
 }
 
 func (o *goWindowsIO) close() error {

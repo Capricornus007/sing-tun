@@ -13,13 +13,13 @@ const segmentRetainCount = 128
 
 // Linux delivers TSO aggregates to the TUN even with IFF_VNET_HDR off
 // (observed on 6.x: the pre-segmentation skb is handed to the fd as-is).
-func (s *ForwardStage) resegmentTCP(flow *forwardFlow, packet *forwardPacket, raw []byte) {
+func (s *ForwardStage) resegmentTCP(flow *forwardFlow, packet *forwardPacket, raw []byte, effectiveMTU uint32) {
 	if len(packet.transport) < header.TCPMinimumSize {
 		return
 	}
 	headerLength := len(raw) - len(packet.transport)
 	if packet.ipVersion == 6 && headerLength != header.IPv6MinimumSize {
-		reply, ok := buildPacketTooBig(header.IPv6(packet.network), flow.effectiveMTU, s.writeback.ReturnHeadroom())
+		reply, ok := buildPacketTooBig(header.IPv6(packet.network), effectiveMTU, s.writeback.ReturnHeadroom())
 		if ok {
 			s.writebackBatch = append(s.writebackBatch, reply)
 		}
@@ -30,7 +30,7 @@ func (s *ForwardStage) resegmentTCP(flow *forwardFlow, packet *forwardPacket, ra
 		return
 	}
 	totalHeaderLength := headerLength + tcpHeaderLength
-	segmentSize := int(flow.effectiveMTU) - totalHeaderLength
+	segmentSize := int(effectiveMTU) - totalHeaderLength
 	if segmentSize <= 0 {
 		return
 	}
@@ -39,7 +39,7 @@ func (s *ForwardStage) resegmentTCP(flow *forwardFlow, packet *forwardPacket, ra
 		gsoType = GSOTCPv6
 	}
 	neededSegments := max((len(raw)-totalHeaderLength+segmentSize-1)/segmentSize, 1)
-	bufs, sizes := s.reserveSegments(neededSegments, int(flow.effectiveMTU))
+	bufs, sizes := s.reserveSegments(neededSegments, int(effectiveMTU))
 	n, err := GSOSplit(raw, GSOOptions{
 		GSOType:    gsoType,
 		HdrLen:     uint16(totalHeaderLength),

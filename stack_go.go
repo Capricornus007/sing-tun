@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,15 +26,25 @@ type Go struct {
 	icmpTimeout          time.Duration
 	udpNATOptions        UDPNatOptions
 	memoryPressure       func() MemoryPressure
-	udpNat               *UDPNat
+	udpNats              []*UDPNat
+	udpIdentification    atomic.Uint32
 	dispatcher           *ForwardDispatcher
 	directory            goFlowDirectory
+	congestion           *goCongestionOps
+	queueFactory         func(stack *Go) ([]goPlatformIO, error)
+	access               sync.Mutex
 	engines              []*goEngine
 	closed               atomic.Bool
 }
 
-func NewGo(options StackOptions) *Go {
+func NewGo(options StackOptions) (*Go, error) {
+	congestion, err := goLookupCongestionControl(options.TCPCongestionControl)
+	if err != nil {
+		return nil, err
+	}
 	return &Go{
+		congestion:           congestion,
+		queueFactory:         newGoPlatformQueues,
 		ctx:                  options.Context,
 		tun:                  options.Tun,
 		mtu:                  int(options.TunOptions.MTU),
@@ -53,11 +64,16 @@ func NewGo(options StackOptions) *Go {
 			ExcludeInterface: []string{options.TunOptions.Name},
 		},
 		memoryPressure: options.MemoryPressure,
-	}
+	}, nil
 }
 
 func (s *Go) Start() error {
-	queues, err := newGoPlatformQueues(s)
+	s.access.Lock()
+	defer s.access.Unlock()
+	if s.closed.Load() {
+		return E.New("stack is closed")
+	}
+	queues, err := s.queueFactory(s)
 	if err != nil {
 		return err
 	}
@@ -75,19 +91,48 @@ func (s *Go) Start() error {
 	udpNATOptions := s.udpNATOptions
 	udpNATOptions.Handler = s.handler
 	udpNATOptions.Prepare = s.prepareUDPConnection
-	udpNat := NewUDPNat(udpNATOptions)
-	err = udpNat.Start()
-	if err != nil {
-		return E.Errors(err, goCloseQueues(queues))
+	maxSize := udpNATOptions.MaxSize
+	if maxSize == 0 {
+		if runtime.GOOS == "ios" {
+			maxSize = 4096
+		} else {
+			maxSize = 16384
+		}
 	}
-	s.udpNat = udpNat
+	natCount := uint32(1)
+	if udpNATOptions.Mapping == NATMappingAddressAndPortDependent {
+		natCount = min(uint32(len(queues)), maxSize)
+	}
+	udpNats := make([]*UDPNat, natCount)
+	for index := range udpNats {
+		udpNATOptions.Shared = index+int(natCount) < len(queues)
+		udpNATOptions.MaxSize = maxSize / natCount
+		if uint32(index) < maxSize%natCount {
+			udpNATOptions.MaxSize++
+		}
+		udpNat := NewUDPNat(udpNATOptions)
+		err = udpNat.Start()
+		if err != nil {
+			udpNat.Close()
+			for _, started := range udpNats[:index] {
+				started.Close()
+			}
+			return E.Errors(err, goCloseQueues(queues))
+		}
+		udpNats[index] = udpNat
+	}
+	s.udpNats = udpNats
 	s.dispatcher = NewForwardDispatcher(s.handler, &goWriteback{platformIO: queues[0]}, s.logger, s.udpTimeout, s.icmpTimeout)
 	if len(queues) > 1 {
 		s.directory.flows = make(map[flowKey]*GoConn)
+		if natCount > 1 {
+			s.directory.udpFlows = make(map[udpNatSessionKey]*GoPacketConn)
+		}
 	}
 	s.engines = make([]*goEngine, len(queues))
 	for index, queue := range queues {
 		s.engines[index] = newGoEngine(s, queue, len(queues))
+		s.engines[index].udpNat = udpNats[index%int(natCount)]
 	}
 	for _, engine := range s.engines {
 		go engine.run()
@@ -103,26 +148,10 @@ func goCloseQueues(queues []goPlatformIO) error {
 	return err
 }
 
-type goWriteback struct {
-	platformIO goPlatformIO
-}
-
-func (w *goWriteback) ReturnHeadroom() int {
-	return w.platformIO.transmitPrefix()
-}
-
-func (w *goWriteback) WriteReturnPackets(packets [][]byte) error {
-	prefix := w.platformIO.transmitPrefix()
-	var writeErr error
-	for _, packet := range packets {
-		writeErr = E.Errors(writeErr, goIgnoreDropped(w.platformIO.writeFrame([][]byte{packet[prefix:]}, ForwardFrameMeta{})))
-	}
-	return writeErr
-}
-
 type goFlowDirectory struct {
-	access sync.RWMutex
-	flows  map[flowKey]*GoConn
+	access   sync.RWMutex
+	flows    map[flowKey]*GoConn
+	udpFlows map[udpNatSessionKey]*GoPacketConn
 }
 
 func (d *goFlowDirectory) insert(key flowKey, conn *GoConn) {
@@ -156,8 +185,13 @@ func (d *goFlowDirectory) lookup(key flowKey) *GoConn {
 }
 
 func (s *Go) ResetNetwork() {
-	if s.udpNat != nil {
-		s.udpNat.Purge()
+	s.access.Lock()
+	defer s.access.Unlock()
+	if s.closed.Load() {
+		return
+	}
+	for _, udpNat := range s.udpNats {
+		udpNat.Purge()
 	}
 	for _, engine := range s.engines {
 		engine.postMessage(&engine.resetMessage)
@@ -165,18 +199,23 @@ func (s *Go) ResetNetwork() {
 }
 
 func (s *Go) Close() error {
+	s.access.Lock()
 	if !s.closed.CompareAndSwap(false, true) {
+		s.access.Unlock()
 		return nil
 	}
 	for _, engine := range s.engines {
 		engine.postMessage(&engine.closeMessage)
 	}
+	s.access.Unlock()
 	for _, engine := range s.engines {
 		<-engine.exitSignal
 	}
-	s.dispatcher.Close()
-	if s.udpNat != nil {
-		s.udpNat.Close()
+	if s.dispatcher != nil {
+		s.dispatcher.Close()
+	}
+	for _, udpNat := range s.udpNats {
+		udpNat.Close()
 	}
 	var err error
 	for _, engine := range s.engines {

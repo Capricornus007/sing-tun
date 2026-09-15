@@ -10,7 +10,9 @@ import (
 
 	"github.com/sagernet/sing-tun/gtcpip/header"
 	rawfile "github.com/sagernet/sing-tun/internal/rawfile_darwin"
+	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
+	N "github.com/sagernet/sing/common/network"
 
 	"golang.org/x/sys/unix"
 )
@@ -52,7 +54,8 @@ type goDarwinIO struct {
 	tunFd                 int
 	kqueueFd              int
 	transmitAccess        *sync.Mutex
-	receiveSlots          [][]byte
+	receiveBuffers        []*buf.Buffer
+	readWaitOptions       N.ReadWaitOptions
 	receiveIovecs         []unix.Iovec
 	messageHeaders        []rawfile.MsgHdrX
 	events                [goSocketEventBatch + 3]unix.Kevent_t
@@ -69,13 +72,15 @@ type goDarwinIO struct {
 	leakedClusters        goDropCounter
 	closing               atomic.Bool
 
-	batchHeaders  []byte
-	batchIovecs   []unix.Iovec
-	batchMessages []rawfile.MsgHdrX
-	batchSpill    []byte
-	batchSpilled  []bool
-	batchStart    int
-	batchCount    int
+	batchHeaders   []byte
+	batchIovecs    []unix.Iovec
+	batchMessages  []rawfile.MsgHdrX
+	batchSpill     []byte
+	batchSpilled   []bool
+	batchStart     int
+	batchCount     int
+	packetIovecs   [goPacketBatchSize * 3]unix.Iovec
+	packetMessages [goPacketBatchSize]rawfile.MsgHdrX
 
 	netif              bool
 	interfaceIndex     int
@@ -89,10 +94,11 @@ type goDarwinIO struct {
 	gateBlocked        atomic.Bool
 	gateIdlePolls      int
 	gateLastConsumed   int64
+	gateProbeEnd       int64
 }
 
-func newGoPlatformIO(stack *Go) (goPlatformIO, error) {
-	return &goDarwinIO{stack: stack, epoch: time.Now()}, nil
+func newGoPlatformQueues(stack *Go) ([]goPlatformIO, error) {
+	return []goPlatformIO{&goDarwinIO{stack: stack, epoch: time.Now()}}, nil
 }
 
 func (o *goDarwinIO) start() error {
@@ -126,18 +132,10 @@ func (o *goDarwinIO) start() error {
 	o.kqueueFd = kqueueFd
 	o.wakeEvent[0] = unix.Kevent_t{Ident: goWakeIdent, Filter: unix.EVFILT_USER, Fflags: unix.NOTE_TRIGGER}
 	o.transmitWritableEvent[0] = unix.Kevent_t{Ident: uint64(o.tunFd), Filter: unix.EVFILT_WRITE, Flags: unix.EV_ADD | unix.EV_ENABLE | unix.EV_ONESHOT}
-	slotSize := o.stack.mtu + PacketOffset
-	storage := make([]byte, goReadBatch*slotSize)
-	o.receiveSlots = make([][]byte, goReadBatch)
 	o.receiveIovecs = make([]unix.Iovec, goReadBatch)
 	o.messageHeaders = make([]rawfile.MsgHdrX, goReadBatch)
 	o.transmitIovecs = make([]unix.Iovec, 0, 8)
 	o.receiveBatch = goReceiveBatchMin
-	for index := range goReadBatch {
-		slot := storage[index*slotSize : (index+1)*slotSize]
-		o.receiveSlots[index] = slot
-		o.receiveIovecs[index] = rawfile.IovecFromBytes(slot)
-	}
 	o.batchHeaders = make([]byte, goDarwinTransmitBatch*goDarwinBatchHeader)
 	o.batchIovecs = make([]unix.Iovec, goDarwinTransmitBatch*goDarwinBatchIovecs)
 	o.batchMessages = make([]rawfile.MsgHdrX, goDarwinTransmitBatch)
@@ -215,7 +213,18 @@ func (o *goDarwinIO) wait(timeout time.Duration, events []goSocketEvent) (bool, 
 		spec := unix.NsecToTimespec(timeout.Nanoseconds())
 		timeoutSpec = &spec
 	}
-	eventCount, err := unix.Kevent(o.kqueueFd, nil, o.events[:], timeoutSpec)
+	var eventCount int
+	var err error
+	if timeout == 0 {
+		//nolint:staticcheck
+		count, _, errno := unix.RawSyscall6(unix.SYS_KEVENT, uintptr(o.kqueueFd), 0, 0, uintptr(unsafe.Pointer(&o.events[0])), uintptr(len(o.events)), uintptr(unsafe.Pointer(timeoutSpec)))
+		eventCount = int(count)
+		if errno != 0 {
+			err = errno
+		}
+	} else {
+		eventCount, err = unix.Kevent(o.kqueueFd, nil, o.events[:], timeoutSpec)
+	}
 	if o.gateBlocked.Load() {
 		o.gatePoll()
 	}
@@ -302,10 +311,26 @@ func (o *goDarwinIO) unregisterSocket(socket *goSocket) {
 	o.socketTokens[socket.fd] = 0
 }
 
-func (o *goDarwinIO) readBurst(frames []goFrame) (int, bool, error) {
+func (o *goDarwinIO) readBurst(frames []goFrame, options N.ReadWaitOptions) (int, bool, error) {
+	if o.receiveBuffers == nil || o.readWaitOptions != options {
+		o.releaseReadBuffers()
+		if o.receiveBuffers == nil {
+			o.receiveBuffers = make([]*buf.Buffer, goReadBatch)
+		}
+		o.readWaitOptions = options
+	}
 	// recvmsg_x walks every submitted msghdr slot, whether or not a packet is pending for it.
 	count := min(o.receiveBatch, len(frames))
 	for index := range count {
+		buffer := o.receiveBuffers[index]
+		if buffer == nil {
+			buffer = options.NewBufferSize(o.stack.mtu + PacketOffset)
+			o.receiveBuffers[index] = buffer
+		}
+		buffer.Reset()
+		buffer.Resize(options.FrontHeadroom, 0)
+		buffer.Reserve(options.RearHeadroom)
+		o.receiveIovecs[index] = rawfile.IovecFromBytes(buffer.FreeBytes())
 		// Cannot clear only the length field. Older versions of the darwin kernel will check whether other data is empty.
 		// https://github.com/Darm64/XNU/blob/xnu-2782.40.9/bsd/kern/uipc_syscalls.c#L2026-L2048
 		o.messageHeaders[index] = rawfile.MsgHdrX{}
@@ -327,13 +352,31 @@ func (o *goDarwinIO) readBurst(frames []goFrame) (int, bool, error) {
 	frameCount := 0
 	for index := range received {
 		dataLen := int(o.messageHeaders[index].DataLen)
-		if dataLen <= PacketOffset {
+		if dataLen <= PacketOffset || dataLen > o.receiveBuffers[index].FreeLen() || o.messageHeaders[index].Msg.Flags&unix.MSG_TRUNC != 0 {
 			continue
 		}
-		frames[frameCount] = goFrame{data: o.receiveSlots[index][PacketOffset:dataLen]}
+		buffer := o.receiveBuffers[index]
+		buffer.Reset()
+		buffer.Resize(options.FrontHeadroom+PacketOffset, dataLen-PacketOffset)
+		frames[frameCount] = goFrame{buffer: buffer}
 		frameCount++
 	}
 	return frameCount, received == 0, nil
+}
+
+func (o *goDarwinIO) releaseReadBuffers() {
+	clear(o.receiveIovecs)
+	clear(o.messageHeaders)
+	buf.ReleaseMulti(o.receiveBuffers)
+	clear(o.receiveBuffers)
+	o.transmitAccess.Lock()
+	clear(o.transmitIovecs)
+	if o.batchCount == 0 {
+		clear(o.batchIovecs)
+		clear(o.batchMessages)
+		o.batchSpill = nil
+	}
+	o.transmitAccess.Unlock()
 }
 
 func receiveMessageBatch(fd int, headers []rawfile.MsgHdrX) (int, unix.Errno) {
@@ -343,12 +386,19 @@ func receiveMessageBatch(fd int, headers []rawfile.MsgHdrX) (int, unix.Errno) {
 }
 
 func (o *goDarwinIO) writeFrame(frame [][]byte, meta ForwardFrameMeta) error {
-	err := o.writePacket(frame)
+	o.transmitAccess.Lock()
+	err := o.writePacketLocked(frame)
+	o.transmitAccess.Unlock()
 	if err == errGoTransmitBlocked {
 		o.droppedEngineFrames.record(o.stack.logger, "engine frames")
 		return errGoFrameDropped
 	}
 	return err
+}
+
+func (o *goDarwinIO) writePacket(packet []byte, meta ForwardFrameMeta) error {
+	frame := [1][]byte{packet}
+	return o.writeFrame(frame[:], meta)
 }
 
 func (o *goDarwinIO) writeData(frame [][]byte, meta ForwardFrameMeta) error {
@@ -362,7 +412,7 @@ func (o *goDarwinIO) writeData(frame [][]byte, meta ForwardFrameMeta) error {
 		return o.writeUnbatchedLocked(frame)
 	}
 	if o.batchCount == goDarwinTransmitBatch {
-		o.flushLocked(false)
+		o.flushLocked()
 		if o.batchCount == goDarwinTransmitBatch {
 			if o.batchStart == 0 {
 				return errGoTransmitBlocked
@@ -403,7 +453,7 @@ func (o *goDarwinIO) writeData(frame [][]byte, meta ForwardFrameMeta) error {
 }
 
 func (o *goDarwinIO) writeUnbatchedLocked(frame [][]byte) error {
-	o.flushLocked(false)
+	o.flushLocked()
 	if o.batchCount > o.batchStart {
 		return errGoTransmitBlocked
 	}
@@ -412,7 +462,7 @@ func (o *goDarwinIO) writeUnbatchedLocked(frame [][]byte) error {
 
 func (o *goDarwinIO) flush() {
 	o.transmitAccess.Lock()
-	o.flushLocked(false)
+	o.flushLocked()
 	o.transmitAccess.Unlock()
 }
 
@@ -434,13 +484,16 @@ func (o *goDarwinIO) gateSample() (int64, bool, bool) {
 		return o.gateEstimate(), false, true
 	}
 	progressed := consumed != o.gateLastConsumed
+	if progressed {
+		o.gateProbeEnd = 0
+	}
 	o.gateLastConsumed = consumed
 	o.gateInflightSample = max(o.gateSubmitted-(consumed-o.gateConsumedBase), 0)
 	o.gateSampledAt = o.gateSubmitted
 	return o.gateInflightSample, progressed, true
 }
 
-func (o *goDarwinIO) gateRoom(pending int, probe bool) int {
+func (o *goDarwinIO) gateRoom(pending int) int {
 	if !o.netif {
 		return pending
 	}
@@ -449,9 +502,7 @@ func (o *goDarwinIO) gateRoom(pending int, probe bool) int {
 		estimate, _, _ = o.gateSample()
 	}
 	room := goDarwinGateHighWater - estimate
-	if room <= 0 && probe && estimate+goDarwinGateProbe < goDarwinGateLimit {
-		room = goDarwinGateProbe
-	}
+	room = max(room, min(o.gateProbeEnd-o.gateSubmitted, goDarwinGateLimit-1-estimate))
 	return int(max(min(room, int64(pending)), 0))
 }
 
@@ -460,13 +511,14 @@ func (o *goDarwinIO) gateRoom(pending int, probe bool) int {
 // For the other errors ctl_send_list frees whatever follows the failing packet, so the call
 // consumed every frame handed to it: the ones before the failure were delivered, the failing one
 // is charged to the kernel (an ENOSPC leaks it), the rest are dropped and left to retransmission.
-func (o *goDarwinIO) flushLocked(probe bool) {
+func (o *goDarwinIO) flushLocked() {
 	pending := o.batchCount - o.batchStart
 	if pending == 0 {
 		o.gateReleaseLocked()
 		return
 	}
-	room := o.gateRoom(pending, probe)
+	room := o.gateRoom(pending)
+	sentFrom := o.batchStart
 	for room > 0 {
 		messages := o.batchMessages[o.batchStart : o.batchStart+room]
 		n, errno := rawfile.NonBlockingSendMMsg(o.tunFd, messages)
@@ -486,21 +538,28 @@ func (o *goDarwinIO) flushLocked(probe bool) {
 		o.gateSubmitted += int64(n)
 		room -= n
 	}
+	clear(o.batchIovecs[sentFrom*goDarwinBatchIovecs : o.batchStart*goDarwinBatchIovecs])
 	if o.batchStart == o.batchCount {
 		o.batchStart = 0
 		o.batchCount = 0
 		o.gateReleaseLocked()
 		return
 	}
-	o.gateBlocked.Store(true)
+	o.gateBlockLocked()
 	o.spillHeld()
+}
+
+func (o *goDarwinIO) gateBlockLocked() {
+	if !o.gateBlocked.Swap(true) {
+		o.wake()
+	}
 }
 
 func (o *goDarwinIO) gateReleaseLocked() {
 	if !o.gateBlocked.Load() {
 		return
 	}
-	if o.netif && o.gateEstimate() >= goDarwinGateHighWater {
+	if o.gateRoom(1) == 0 {
 		return
 	}
 	o.gateBlocked.Store(false)
@@ -526,6 +585,7 @@ func (o *goDarwinIO) recordWriteError(errno unix.Errno) {
 		o.gateSampledTime.Store(int64(time.Since(o.epoch)))
 		o.gateInflightSample = goDarwinGateLimit + 1
 		o.gateSampledAt = o.gateSubmitted
+		o.gateProbeEnd = 0
 		return
 	}
 	o.droppedBatchFrames.record(o.stack.logger, "batched frames")
@@ -539,7 +599,7 @@ func (o *goDarwinIO) gatePoll() {
 	}
 	_, progressed, sampled := o.gateSample()
 	if !sampled {
-		o.flushLocked(false)
+		o.flushLocked()
 		return
 	}
 	if progressed {
@@ -547,10 +607,11 @@ func (o *goDarwinIO) gatePoll() {
 	} else {
 		o.gateIdlePolls++
 	}
-	o.flushLocked(o.gateIdlePolls >= goDarwinGateProbeAfter)
 	if o.gateIdlePolls >= goDarwinGateProbeAfter {
+		o.gateProbeEnd = o.gateSubmitted + goDarwinGateProbe
 		o.gateIdlePolls = 0
 	}
+	o.flushLocked()
 }
 
 func (o *goDarwinIO) spillHeld() {
@@ -570,6 +631,7 @@ func (o *goDarwinIO) spillHeld() {
 			length += copy(spill[length:], bytesFromIovec(iovec))
 		}
 		iovecs[1] = rawfile.IovecFromBytes(spill[:length])
+		clear(iovecs[2:])
 		message.Msg.Iovlen = 2
 		o.batchSpilled[slot] = true
 	}
@@ -608,17 +670,17 @@ func (o *goDarwinIO) compactBatch() {
 		o.batchMessages[target].Msg.Iovlen = int32(len(targetIovecs))
 		o.batchSpilled[target] = o.batchSpilled[slot]
 	}
+	clear(o.batchIovecs[(o.batchCount-o.batchStart)*goDarwinBatchIovecs : o.batchCount*goDarwinBatchIovecs])
 	o.batchCount -= o.batchStart
 	o.batchStart = 0
 }
 
-func (o *goDarwinIO) writePacket(frame [][]byte) error {
-	o.transmitAccess.Lock()
-	defer o.transmitAccess.Unlock()
-	return o.writePacketLocked(frame)
-}
-
 func (o *goDarwinIO) writePacketLocked(frame [][]byte) error {
+	defer func() { clear(o.transmitIovecs) }()
+	if o.gateRoom(1) == 0 {
+		o.gateBlockLocked()
+		return errGoTransmitBlocked
+	}
 	headerVec := packetHeaderVec6
 	if header.IPVersion(frame[0]) == header.IPv4Version {
 		headerVec = packetHeaderVec4
@@ -646,13 +708,14 @@ func (o *goDarwinIO) writePacketLocked(frame [][]byte) error {
 		if errno == unix.ENOSPC {
 			o.gateSubmitted++
 			o.recordWriteError(errno)
-			o.gateBlocked.Store(true)
+			o.gateBlockLocked()
 			return errGoTransmitBlocked
 		}
-		if errno == unix.ENOBUFS {
+		if errno == unix.ENOBUFS || errno == unix.EAGAIN {
 			if o.closing.Load() {
 				return os.ErrClosed
 			}
+			o.gateBlockLocked()
 			return errGoTransmitBlocked
 		}
 		return errno
@@ -690,10 +753,85 @@ func (o *goDarwinIO) wake() {
 	_, _ = unix.Kevent(o.kqueueFd, o.wakeEvent[:], nil, nil)
 }
 
-func (o *goDarwinIO) drainWake() {
-}
-
 func (o *goDarwinIO) close() error {
 	o.closing.Store(true)
 	return unix.Close(o.kqueueFd)
+}
+
+func (o *goDarwinIO) writePacketBatch(frames []goUDPFrame) error {
+	o.transmitAccess.Lock()
+	defer o.transmitAccess.Unlock()
+	defer func() {
+		clear(o.packetMessages[:])
+		clear(o.packetIovecs[:])
+	}()
+	o.flushLocked()
+	limit := len(frames)
+	for index := 0; index < len(frames); {
+		room := o.gateRoom(min(len(frames)-index, limit))
+		if room == 0 || o.batchCount > o.batchStart {
+			o.gateBlockLocked()
+			o.droppedEngineFrames.record(o.stack.logger, "UDP frames")
+			return errGoFrameDropped
+		}
+		frame := &frames[index]
+		if frame.length+len(frame.payload) > goDarwinBatchFrameLimit {
+			segments := [2][]byte{frame.header[:frame.length], frame.payload}
+			err := o.writePacketLocked(segments[:])
+			if err == errGoTransmitBlocked {
+				o.droppedEngineFrames.record(o.stack.logger, "UDP frames")
+				return errGoFrameDropped
+			} else if err != nil {
+				return err
+			}
+			index++
+			continue
+		}
+		count := 0
+		for count < room {
+			next := &frames[index+count]
+			if next.length+len(next.payload) > goDarwinBatchFrameLimit {
+				break
+			}
+			iovecs := o.packetIovecs[count*3 : (count+1)*3]
+			iovecs[0] = packetHeaderVec6
+			if next.length == header.IPv4MinimumSize+header.UDPMinimumSize {
+				iovecs[0] = packetHeaderVec4
+			}
+			iovecs[1] = rawfile.IovecFromBytes(next.header[:next.length])
+			iovecCount := 2
+			if len(next.payload) > 0 {
+				iovecs[2] = rawfile.IovecFromBytes(next.payload)
+				iovecCount++
+			}
+			o.packetMessages[count] = rawfile.MsgHdrX{}
+			o.packetMessages[count].Msg.Iov = &iovecs[0]
+			o.packetMessages[count].Msg.Iovlen = int32(iovecCount)
+			count++
+		}
+		written, errno := rawfile.NonBlockingSendMMsg(o.tunFd, o.packetMessages[:count])
+		if errno == unix.EINTR {
+			continue
+		}
+		if (errno == unix.EMSGSIZE || errno == unix.ENOBUFS) && count > 1 {
+			limit = (count + 1) / 2
+			continue
+		}
+		if errno == unix.ENOBUFS || errno == unix.EAGAIN {
+			o.gateBlockLocked()
+			o.droppedEngineFrames.record(o.stack.logger, "UDP frames")
+			return errGoFrameDropped
+		}
+		if errno != 0 {
+			o.gateSubmitted += int64(count)
+			o.recordWriteError(errno)
+			return errGoFrameDropped
+		}
+		if written == 0 {
+			return unix.EIO
+		}
+		o.gateSubmitted += int64(written)
+		index += written
+	}
+	return nil
 }

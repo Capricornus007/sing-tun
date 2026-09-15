@@ -513,7 +513,7 @@ func (s *ForwardStage) createFlow(packet *forwardPacket, verdict FlowVerdict) (*
 	if nat == nil {
 		return nil, createFlowUnsupported
 	}
-	selector, reverseKey, allocated := nat.allocateSelector(packet.protocol, portAddress, serverAddress, serverPort, packet.source.Port())
+	selector, reverseKey, allocated := nat.reserveSelector(packet.protocol, portAddress, serverAddress, serverPort, packet.source.Port())
 	if !allocated {
 		return nil, createFlowExhausted
 	}
@@ -607,16 +607,24 @@ func (d *ForwardDispatcher) natFor(port Port) *portNAT {
 }
 
 func (s *ForwardStage) forwardToPort(flow *forwardFlow, packet *forwardPacket, raw []byte, meta *ForwardFrameMeta) {
+	effectiveMTU := flow.effectiveMTU
 	if meta != nil {
 		meta.completeChecksum(raw)
+		if meta.gsoSize != 0 && packet.protocol == uint8(header.TCPProtocolNumber) {
+			headerLength := len(raw) - len(packet.transport) + int(header.TCP(packet.transport).DataOffset())
+			offloadMTU := uint32(headerLength) + uint32(meta.gsoSize)
+			if effectiveMTU == 0 || offloadMTU < effectiveMTU {
+				effectiveMTU = offloadMTU
+			}
+		}
 	}
-	if flow.effectiveMTU != 0 && uint32(len(raw)) > flow.effectiveMTU {
+	if effectiveMTU != 0 && uint32(len(raw)) > effectiveMTU {
 		if packet.protocol == uint8(header.TCPProtocolNumber) {
 			if flow.tracker != nil {
 				flow.tracker.CountForward(len(raw))
 			}
 			rewriteForward(flow, packet)
-			s.resegmentTCP(flow, packet, raw)
+			s.resegmentTCP(flow, packet, raw, effectiveMTU)
 			return
 		}
 		if packet.ipVersion == 4 {
