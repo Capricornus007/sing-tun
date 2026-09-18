@@ -1,4 +1,4 @@
-//go:build !(darwin || linux || windows)
+//go:build !(linux || windows || darwin)
 
 package tun
 
@@ -9,6 +9,16 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
+const goEngineTransmits = false
+
+func newGoPlatformQueues(stack *Go) ([]goPlatformIO, error) {
+	return nil, E.New("go: unsupported platform")
+}
+
+func goFatalReadError(err error) bool {
+	return true
+}
+
 const goSpliceDuplicatesSocket = false
 
 type goIOVector struct{}
@@ -17,6 +27,9 @@ type goSocket struct{}
 
 func goSpliceSocket(conn syscall.Conn) (goSocket, error) {
 	return goSocket{}, E.New("go: splice not supported")
+}
+
+func (s *goSocket) close() {
 }
 
 func (s *goSocket) readVector(iovecs []goIOVector) (int, syscall.Errno) {
