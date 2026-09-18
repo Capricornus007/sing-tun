@@ -384,7 +384,7 @@ retry:
 		var packet []byte
 		packet, err = t.session.ReceivePacket()
 		switch err {
-		case nil:
+		case 0:
 			n = copy(p, packet)
 			t.session.ReleaseReceivePacket(packet)
 			t.rate.update(uint64(n))
@@ -436,7 +436,7 @@ retry:
 		}
 		packet, err := t.session.ReceivePacket()
 		switch err {
-		case nil:
+		case 0:
 			packetSize := len(packet)
 			t.rate.update(uint64(packetSize))
 			return packet, func() {
@@ -477,7 +477,7 @@ retry:
 		}
 		packet, err := t.session.ReceivePacket()
 		switch err {
-		case nil:
+		case 0:
 			packetSize := len(packet)
 			block(packet)
 			t.session.ReleaseReceivePacket(packet)
