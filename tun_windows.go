@@ -382,8 +382,8 @@ retry:
 			return 0, os.ErrClosed
 		}
 		var packet []byte
-		packet, err = t.session.ReceivePacket()
-		switch err {
+		packet, errno := t.session.ReceivePacket()
+		switch errno {
 		case 0:
 			n = copy(p, packet)
 			t.session.ReleaseReceivePacket(packet)
@@ -401,7 +401,7 @@ retry:
 		case windows.ERROR_INVALID_DATA:
 			return 0, errors.New("send ring corrupt")
 		}
-		return 0, fmt.Errorf("read failed: %w", err)
+		return 0, fmt.Errorf("read failed: %w", errno)
 	}
 }
 
@@ -575,7 +575,7 @@ func (t *NativeTun) receiveInto(buffer []byte) (int, error) {
 			return 0, os.ErrClosed
 		}
 		packet, err := t.session.ReceivePacket()
-		if err != nil {
+		if err != 0 {
 			switch err {
 			case windows.ERROR_NO_MORE_ITEMS:
 				return 0, nil
@@ -607,7 +607,7 @@ func (t *NativeTun) transmitGather(segments [][]byte) error {
 		packetSize += len(segment)
 	}
 	packet, err := t.session.AllocateSendPacket(packetSize)
-	if err != nil {
+	if err != 0 {
 		if err == windows.ERROR_HANDLE_EOF {
 			return os.ErrClosed
 		}

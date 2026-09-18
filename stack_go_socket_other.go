@@ -9,6 +9,8 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
+const goSpliceDuplicatesSocket = false
+
 type goIOVector struct{}
 
 type goSocket struct{}
