@@ -151,7 +151,7 @@ func TestWaitCompletionPacketLatency(t *testing.T) {
 		started := time.Now()
 		var removed uint32
 		waitErr := afd.GetQueuedCompletionStatusEx(iocp, &completions[0], uint32(len(completions)), &removed, 1000, false)
-		if waitErr != nil {
+		if waitErr != 0 {
 			t.Fatalf("round %d: %v", round, waitErr)
 		}
 		total += time.Since(started)
