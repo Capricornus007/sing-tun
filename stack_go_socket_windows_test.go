@@ -53,6 +53,7 @@ func TestSpliceSocketReadiness(t *testing.T) {
 	}
 	defer device.Close()
 	io := &goWindowsIO{iocp: iocp, afd: device, ringDrained: false}
+	io.entries = make(map[*goAFDEntry]struct{})
 	err = io.registerSocket(&socket, 7, goInterestRead)
 	if err != nil {
 		t.Fatal(err)
@@ -196,6 +197,7 @@ func TestAFDPollWithPendingData(t *testing.T) {
 	}
 	defer device.Close()
 	io := &goWindowsIO{iocp: iocp, afd: device}
+	io.entries = make(map[*goAFDEntry]struct{})
 	_, err = client.Write([]byte("ping"))
 	if err != nil {
 		t.Fatal(err)
