@@ -49,7 +49,7 @@ func TestNetworkUpdateMonitorReceiveOverrun(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, controlErr)
 
-	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "tunmon" + strconv.Itoa(os.Getpid())}}
+	link := &netlink.Dummy{Name: "tunmon" + strconv.Itoa(os.Getpid())}
 	require.NoError(t, netlink.LinkAdd(link))
 	defer netlink.LinkDel(link)
 	require.NoError(t, netlink.LinkSetUp(link))

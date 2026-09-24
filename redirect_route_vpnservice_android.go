@@ -185,8 +185,7 @@ func (r *autoRedirect) updateAndroidVPNServiceRules() error {
 	}
 	rules, err := r.discoverAndroidVPNServiceRules()
 	if err != nil {
-		var linkNotFound netlink.LinkNotFoundError
-		if errors.As(err, &linkNotFound) {
+		if _, ok := errors.AsType[netlink.LinkNotFoundError](err); ok {
 			return nil
 		}
 		return err
