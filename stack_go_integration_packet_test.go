@@ -291,10 +291,9 @@ func TestGoKernelPacket(t *testing.T) {
 								peer.SetWriteBuffer(1 << 20)
 								upstream.SetWriteBuffer(1 << 20)
 								peer.SetDeadline(time.Now().Add(3 * time.Second))
-								upstreamSplice := SpliceOptions{OnClose: func(error) { upstream.Close() }}
 								accepted := conn.Splice(&kernelPacketSocket{UDPConn: upstream}, SplicePacketOptions{
 									NAT:           PacketNAT{Origin: destination, Destination: M.SocksaddrFromNet(peer.LocalAddr())},
-									SpliceOptions: upstreamSplice,
+									SpliceOptions: SpliceOptions{OnClose: func(error) { upstream.Close() }},
 								})
 								if !accepted {
 									scenarioTest.Fatal("UDP splice refused")
@@ -334,14 +333,13 @@ func TestGoKernelPacket(t *testing.T) {
 									N.PutPacketBuffer(cached)
 									scenarioTest.Fatal(err)
 								}
-								associateSplice := SpliceOptions{OnClose: func(error) { associateConn.Close() }}
 								accepted := conn.Splice(&kernelPacketSocket{UDPConn: upstream}, SplicePacketOptions{
 									NAT:           PacketNAT{Origin: destination, Destination: socksDestination},
 									Cached:        []*N.PacketBuffer{cached},
 									Offload:       offload,
 									FrontHeadroom: N.CalculateFrontHeadroom(associateConn),
 									RearHeadroom:  N.CalculateRearHeadroom(associateConn),
-									SpliceOptions: associateSplice,
+									SpliceOptions: SpliceOptions{OnClose: func(error) { associateConn.Close() }},
 								})
 								if !accepted {
 									scenarioTest.Fatal("UDP splice refused")
