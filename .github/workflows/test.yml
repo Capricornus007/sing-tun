@@ -20,6 +20,11 @@ jobs:
   test:
     name: ${{ matrix.os }} (Go ${{ matrix.go }})
     runs-on: ${{ matrix.os }}
+    # 非 Linux 平台的紅不追修（用戶規矩：sing-* 線只驗 Android/Linux 實路徑）。
+    # 舊版 windows / darwin 兩個 job 本來就各帶 continue-on-error: true，
+    # 改成上游的單 job × 矩陣時若漏掉這條，TestGoKernelPacketMapping 這類
+    # 依賴 Linux netns / 核心 TUN 的整合測試會讓整輪變紅。
+    continue-on-error: ${{ matrix.os != 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
