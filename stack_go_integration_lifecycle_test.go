@@ -247,7 +247,8 @@ func TestGoKernelClose(t *testing.T) {
 						n, err := conn.Write(payload)
 						progress[index].Add(int64(n))
 						if err != nil {
-							completed <- pendingResult{connection: index, operation: "write", kernelIOResult: kernelIOResult{n: n, err: err}}
+							writeResult := kernelIOResult{n: n, err: err}
+							completed <- pendingResult{connection: index, operation: "write", kernelIOResult: writeResult}
 							return
 						}
 					}
@@ -258,9 +259,11 @@ func TestGoKernelClose(t *testing.T) {
 					if err == nil && probe[0] != 0x71 {
 						err = E.New("shutdown read probe corrupted")
 					}
-					reading <- kernelIOResult{n: n, err: err}
+					readResult := kernelIOResult{n: n, err: err}
+					reading <- readResult
 					n, err = conn.Read(probe[:])
-					completed <- pendingResult{connection: index, operation: "read", kernelIOResult: kernelIOResult{n: n, err: err}}
+					nextRead := kernelIOResult{n: n, err: err}
+					completed <- pendingResult{connection: index, operation: "read", kernelIOResult: nextRead}
 				}()
 				_, err := client.Write([]byte{0x71})
 				if err != nil {
