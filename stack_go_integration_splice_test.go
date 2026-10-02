@@ -93,7 +93,7 @@ func TestGoKernelSpliceOwnership(t *testing.T) {
 		address := upstream.LocalAddr().(*net.UDPAddr)
 		closed := make(chan error, 1)
 		owner := &kernelPacketSocket{UDPConn: upstream}
-		accepted := conn.Splice(owner, SplicePacketOptions{
+		accepted := conn.Splice(owner, SplicePacketOptions{ //nolint:modernize // 同上：提升嵌入欄位會改語意
 			NAT:           PacketNAT{Origin: destination, Destination: M.SocksaddrFromNet(peer.LocalAddr())},
 			SpliceOptions: SpliceOptions{OnClose: func(closeError error) { closed <- closeError }},
 		})

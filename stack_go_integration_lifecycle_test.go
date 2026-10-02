@@ -247,7 +247,7 @@ func TestGoKernelClose(t *testing.T) {
 						n, err := conn.Write(payload)
 						progress[index].Add(int64(n))
 						if err != nil {
-							completed <- pendingResult{connection: index, operation: "write", kernelIOResult: kernelIOResult{n: n, err: err}}
+							completed <- pendingResult{connection: index, operation: "write", kernelIOResult: kernelIOResult{n: n, err: err}} //nolint:modernize // 自動修復會把嵌入欄位提升為同名字串，語意改變（CI test #33 實測紅）
 							return
 						}
 					}
@@ -260,7 +260,7 @@ func TestGoKernelClose(t *testing.T) {
 					}
 					reading <- kernelIOResult{n: n, err: err}
 					n, err = conn.Read(probe[:])
-					completed <- pendingResult{connection: index, operation: "read", kernelIOResult: kernelIOResult{n: n, err: err}}
+					completed <- pendingResult{connection: index, operation: "read", kernelIOResult: kernelIOResult{n: n, err: err}} //nolint:modernize // 自動修復會把嵌入欄位提升為同名字串，語意改變（CI test #33 實測紅）
 				}()
 				_, err := client.Write([]byte{0x71})
 				if err != nil {

@@ -291,7 +291,7 @@ func TestGoKernelPacket(t *testing.T) {
 								peer.SetWriteBuffer(1 << 20)
 								upstream.SetWriteBuffer(1 << 20)
 								peer.SetDeadline(time.Now().Add(3 * time.Second))
-								accepted := conn.Splice(&kernelPacketSocket{UDPConn: upstream}, SplicePacketOptions{
+								accepted := conn.Splice(&kernelPacketSocket{UDPConn: upstream}, SplicePacketOptions{ //nolint:modernize // 自動修復會把嵌入欄位提升為同名字串，語意改變（CI test #33 實測紅）
 									NAT:           PacketNAT{Origin: destination, Destination: M.SocksaddrFromNet(peer.LocalAddr())},
 									SpliceOptions: SpliceOptions{OnClose: func(error) { upstream.Close() }},
 								})
@@ -333,7 +333,7 @@ func TestGoKernelPacket(t *testing.T) {
 									N.PutPacketBuffer(cached)
 									scenarioTest.Fatal(err)
 								}
-								accepted := conn.Splice(&kernelPacketSocket{UDPConn: upstream}, SplicePacketOptions{
+								accepted := conn.Splice(&kernelPacketSocket{UDPConn: upstream}, SplicePacketOptions{ //nolint:modernize // 同上：提升嵌入欄位會改語意
 									NAT:           PacketNAT{Origin: destination, Destination: socksDestination},
 									Cached:        []*N.PacketBuffer{cached},
 									Offload:       offload,
