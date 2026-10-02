@@ -293,7 +293,7 @@ func TestGoKernelPacket(t *testing.T) {
 								peer.SetDeadline(time.Now().Add(3 * time.Second))
 								accepted := conn.Splice(&kernelPacketSocket{UDPConn: upstream}, SplicePacketOptions{ //nolint:modernize // 自動修復會把嵌入欄位提升為同名字串，語意改變（CI test #33 實測紅）
 									NAT:           PacketNAT{Origin: destination, Destination: M.SocksaddrFromNet(peer.LocalAddr())},
-									SpliceOptions: SpliceOptions{OnClose: func(error) { upstream.Close() }},
+									SpliceOptions: SpliceOptions{OnClose: func(error) { upstream.Close() }}, //nolint:modernize // CI 版 golangci 把這條記在嵌入欄位行（本機記在結構字面值起始行），兩處都要標
 								})
 								if !accepted {
 									scenarioTest.Fatal("UDP splice refused")
@@ -339,7 +339,7 @@ func TestGoKernelPacket(t *testing.T) {
 									Offload:       offload,
 									FrontHeadroom: N.CalculateFrontHeadroom(associateConn),
 									RearHeadroom:  N.CalculateRearHeadroom(associateConn),
-									SpliceOptions: SpliceOptions{OnClose: func(error) { associateConn.Close() }},
+									SpliceOptions: SpliceOptions{OnClose: func(error) { associateConn.Close() }}, //nolint:modernize // CI 版 golangci 把這條記在嵌入欄位行（本機記在結構字面值起始行），兩處都要標
 								})
 								if !accepted {
 									scenarioTest.Fatal("UDP splice refused")
