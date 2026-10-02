@@ -247,7 +247,7 @@ func TestGoKernelClose(t *testing.T) {
 						n, err := conn.Write(payload)
 						progress[index].Add(int64(n))
 						if err != nil {
-							completed <- pendingResult{connection: index, operation: "write", kernelIOResult: kernelIOResult{n: n, err: err}}
+							completed <- pendingResult{connection: index, operation: "write", n: n, err: err}
 							return
 						}
 					}
@@ -260,7 +260,7 @@ func TestGoKernelClose(t *testing.T) {
 					}
 					reading <- kernelIOResult{n: n, err: err}
 					n, err = conn.Read(probe[:])
-					completed <- pendingResult{connection: index, operation: "read", kernelIOResult: kernelIOResult{n: n, err: err}}
+					completed <- pendingResult{connection: index, operation: "read", n: n, err: err}
 				}()
 				_, err := client.Write([]byte{0x71})
 				if err != nil {
