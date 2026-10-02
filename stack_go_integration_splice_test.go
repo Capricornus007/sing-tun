@@ -95,7 +95,7 @@ func TestGoKernelSpliceOwnership(t *testing.T) {
 		owner := &kernelPacketSocket{UDPConn: upstream}
 		accepted := conn.Splice(owner, SplicePacketOptions{ //nolint:modernize // 同上：提升嵌入欄位會改語意
 			NAT:           PacketNAT{Origin: destination, Destination: M.SocksaddrFromNet(peer.LocalAddr())},
-			SpliceOptions: SpliceOptions{OnClose: func(closeError error) { closed <- closeError }},
+			SpliceOptions: SpliceOptions{OnClose: func(closeError error) { closed <- closeError }}, //nolint:modernize // CI 版記在嵌入欄位行、本機記在字面值起始行
 		})
 		if !accepted {
 			packetTest.Fatal("UDP splice refused")
