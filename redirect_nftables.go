@@ -55,7 +55,7 @@ func (r *autoRedirect) setupNFTables() error {
 	}
 
 	if !r.shouldSkipOutputChain() {
-		outputNATPriority := new(*nftables.ChainPriorityMangle + 2)
+		outputNATPriority := nftables.ChainPriorityRef(*nftables.ChainPriorityMangle + 2)
 		chainOutput := nft.AddChain(&nftables.Chain{
 			Name:     "output",
 			Table:    table,
@@ -125,8 +125,8 @@ func (r *autoRedirect) setupNFTables() error {
 		r.nftablesCreateRedirectPortReject(nft, table, chainInput)
 	}
 
-	preroutingNATPriority := new(*nftables.ChainPriorityNATDest + 2)
-	preroutingRoutePriority := new(*nftables.ChainPriorityNATDest + 3)
+	preroutingNATPriority := nftables.ChainPriorityRef(*nftables.ChainPriorityNATDest + 2)
+	preroutingRoutePriority := nftables.ChainPriorityRef(*nftables.ChainPriorityNATDest + 3)
 	chainPreRouting := nft.AddChain(&nftables.Chain{
 		Name:     "prerouting",
 		Table:    table,
@@ -389,7 +389,7 @@ func (r *autoRedirect) nftablesCreatePreMatchChains(nft *nftables.Conn, table *n
 		Name:     "prerouting_prematch",
 		Table:    table,
 		Hooknum:  nftables.ChainHookPrerouting,
-		Priority: new(*nftables.ChainPriorityNATDest - 1),
+		Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityNATDest - 1),
 		Type:     nftables.ChainTypeFilter,
 	})
 	err := r.nftablesAddPreMatchRules(nft, table, chainPreroutingPreMatch, true)
@@ -402,7 +402,7 @@ func (r *autoRedirect) nftablesCreatePreMatchChains(nft *nftables.Conn, table *n
 			Name:     "output_prematch",
 			Table:    table,
 			Hooknum:  nftables.ChainHookOutput,
-			Priority: new(*nftables.ChainPriorityMangle + 1),
+			Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityMangle + 1),
 			Type:     nftables.ChainTypeRoute,
 		})
 		err = r.nftablesAddPreMatchRules(nft, table, chainOutputPreMatch, false)
