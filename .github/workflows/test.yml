@@ -18,26 +18,20 @@ on:
 
 jobs:
   test:
-    name: ${{ matrix.os }} (Go ${{ matrix.go }})
+    # Go 改吃 feed 的 go-git（golang/go master tip），原本 name 裡的「(Go x.y.z)」
+    # 已沒有資料來源，改成只標平台。
+    name: Linux
     runs-on: ${{ matrix.os }}
-    # 非 Linux 平台的紅不追修（用戶規矩：sing-* 線只驗 Android/Linux 實路徑）。
-    # 舊版 windows / darwin 兩個 job 本來就各帶 continue-on-error: true，
-    # 改成上游的單 job × 矩陣時若漏掉這條，TestGoKernelPacketMapping 這類
-    # 依賴 Linux netns / 核心 TUN 的整合測試會讓整輪變紅。
-    continue-on-error: ${{ matrix.os != 'ubuntu-latest' }}
+    # 原本有 continue-on-error: ${{ matrix.os != 'ubuntu-latest' }}（非 Linux 的紅不追修）。
+    # 用戶 2026-10-11 裁「其他系統整條刪」之後只剩 ubuntu-latest，這條恆為 false → 移除。
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        # 上游這裡寫 ['1.25.x', '1.26.x', stable]，但本倉 go.mod 要求 go 1.27.1 且
-        # GOTOOLCHAIN=local（不许自动下载工具链），那兩條腿會直接編不過。
-        # 版本字串一律釘精確值，矩陣只用来铺平台。
-        go: ['1.27.1']
-        include:
-          - os: windows-latest
-            go: '1.27.1'
-          - os: macos-latest
-            go: '1.27.1'
+        # 用戶 2026-10-11 裁：其他系統整條刪 —— 原本 include 裡的
+        # windows-latest / macos-latest 兩條已移除。
+        # 原本的「Go 版本」矩陣維度只餵給被取代的那步安裝，沒有消費者，
+        # 留著就是「CI 在測 1.27.1」的假陳述 → 一併移除。
     env:
       GOTOOLCHAIN: local
     steps:
@@ -45,29 +39,27 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Setup Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: ${{ matrix.go }}
+      - name: Install Go from the feed (golang/go master tip)
+        uses: Capricornus007/repo/.github/actions/setup-feed-go@master
       - name: Install network test tools
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y iproute2
       - name: Test
         env:
-          TEST_FLAGS: ${{ runner.os == 'Windows' && '' || '-exec sudo' }}
+          # 原本寫成 ${{ runner.os == 'Windows' && '' || '-exec sudo' }}；
+          # Windows job 已整條刪，只剩 Linux → 直接給值，不再用運算式。
+          TEST_FLAGS: -exec sudo
         run: |
           go build -v .
           # 排除两条依赖干净 netns + 精确内核时序的整合测试（TestGoConnKeepalive、
           # TestGoKernelZeroWindowHalfClose）：二者在上游原始提交下同样不稳定，
           # 在共享 runner 上会挂起；本地 `make test` 仍会跑它们。
           go test -v $TEST_FLAGS -skip 'TestGoConnKeepalive|TestGoKernelZeroWindowHalfClose' ./...
-      - name: Test unprivileged ping
-        if: runner.os != 'Linux'
-        run: go test -v ./ping
+      # 原本這裡還有一步 "Test unprivileged ping"（if: runner.os != 'Linux'），
+      # 在只剩 Linux 的矩陣下永遠不會跑 → 隨其他系統的刪除一併移除。
       - name: Test privileged ping
-        if: runner.os != 'Windows'
+        # 原本帶 if: runner.os != 'Windows'，Windows 已刪 → 條件去掉、步驟照跑。
         run: |
           go test -c -o ping_test ./ping
           sudo ./ping_test -test.v
