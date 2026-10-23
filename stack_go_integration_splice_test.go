@@ -93,9 +93,9 @@ func TestGoKernelSpliceOwnership(t *testing.T) {
 		address := upstream.LocalAddr().(*net.UDPAddr)
 		closed := make(chan error, 1)
 		owner := &kernelPacketSocket{UDPConn: upstream}
-		accepted := conn.Splice(owner, SplicePacketOptions{
+		accepted := conn.Splice(owner, SplicePacketOptions{ //nolint:modernize // 自動修復會把嵌入欄位提升為同名字串，語意改變（CI test #33 實測紅）
 			NAT:           PacketNAT{Origin: destination, Destination: M.SocksaddrFromNet(peer.LocalAddr())},
-			SpliceOptions: SpliceOptions{OnClose: func(closeError error) { closed <- closeError }},
+			SpliceOptions: SpliceOptions{OnClose: func(closeError error) { closed <- closeError }}, //nolint:modernize // CI 版 golangci 把這條記在嵌入欄位行（本機記在結構字面值起始行），兩處都要標
 		})
 		if !accepted {
 			packetTest.Fatal("UDP splice refused")
