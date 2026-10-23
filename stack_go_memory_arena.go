@@ -205,8 +205,8 @@ func (s *goArenaSlabStore) purge() {
 	}
 	clear(s.cached)
 	s.cached = s.cached[:0]
-	for _, v := range slices.Backward(s.chunks) {
-		s.trim(v)
+	for _, chunk := range slices.Backward(s.chunks) {
+		s.trim(chunk)
 	}
 }
 
